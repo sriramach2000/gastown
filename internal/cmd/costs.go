@@ -137,6 +137,17 @@ type SessionCost struct {
 	Worker  string  `json:"worker,omitempty"`
 	Cost    float64 `json:"cost_usd"`
 	Running bool    `json:"running"`
+
+	// Token-paradigm fields (operator on subscription, not pay-as-you-go):
+	// view "cost" as throughput (tokens in/out) rather than USD. These are
+	// the raw counters extracted from the Claude Code transcript before
+	// modelPricing multiplication. Per audit-v3.0:B-USAGE-12 + operator
+	// directive 2026-05-19.
+	InputTokens       int    `json:"input_tokens"`
+	OutputTokens      int    `json:"output_tokens"`
+	CacheReadTokens   int    `json:"cache_read_tokens,omitempty"`
+	CacheCreateTokens int    `json:"cache_create_tokens,omitempty"`
+	Model             string `json:"model,omitempty"`
 }
 
 // CostEntry is a ledger entry for historical cost tracking.
@@ -253,8 +264,10 @@ func runLiveCosts() error {
 			continue
 		}
 
-		// Extract cost from Claude transcript
-		cost, err := extractCostFromWorkDir(workDir)
+		// Extract usage (token I/O) + cost from Claude transcript.
+		// Per audit-v3.0:B-USAGE-12, the token fields let subscription
+		// operators view throughput directly rather than USD.
+		usage, cost, err := extractUsageFromWorkDir(workDir)
 		if err != nil {
 			if costsVerbose {
 				fmt.Fprintf(os.Stderr, "[costs] could not extract cost for %s: %v\n", sess, err)
@@ -266,14 +279,22 @@ func runLiveCosts() error {
 		// Check if an agent appears to be running
 		running := t.IsAgentRunning(sess)
 
-		costs = append(costs, SessionCost{
+		entry := SessionCost{
 			Session: sess,
 			Role:    role,
 			Rig:     rig,
 			Worker:  worker,
 			Cost:    cost,
 			Running: running,
-		})
+		}
+		if usage != nil {
+			entry.InputTokens = usage.InputTokens
+			entry.OutputTokens = usage.OutputTokens
+			entry.CacheReadTokens = usage.CacheReadInputTokens
+			entry.CacheCreateTokens = usage.CacheCreationInputTokens
+			entry.Model = usage.Model
+		}
+		costs = append(costs, entry)
 		total += cost
 	}
 
@@ -805,22 +826,31 @@ func calculateCost(usage *TokenUsage) float64 {
 // extractCostFromWorkDir extracts cost from Claude Code transcript for a working directory.
 // This reads the most recent transcript file and sums all token usage.
 func extractCostFromWorkDir(workDir string) (float64, error) {
+	_, cost, err := extractUsageFromWorkDir(workDir)
+	return cost, err
+}
+
+// extractUsageFromWorkDir returns the parsed TokenUsage in addition to the
+// computed USD cost, so callers that care about the token-paradigm view
+// (operator on subscription, not pay-as-you-go) can surface throughput.
+// Per audit-v3.0:B-USAGE-12 + operator directive 2026-05-19.
+func extractUsageFromWorkDir(workDir string) (*TokenUsage, float64, error) {
 	projectDir, err := getClaudeProjectDir(workDir)
 	if err != nil {
-		return 0, fmt.Errorf("getting project dir: %w", err)
+		return nil, 0, fmt.Errorf("getting project dir: %w", err)
 	}
 
 	transcriptPath, err := findLatestTranscript(projectDir)
 	if err != nil {
-		return 0, fmt.Errorf("finding transcript: %w", err)
+		return nil, 0, fmt.Errorf("finding transcript: %w", err)
 	}
 
 	usage, err := parseTranscriptUsage(transcriptPath)
 	if err != nil {
-		return 0, fmt.Errorf("parsing transcript: %w", err)
+		return nil, 0, fmt.Errorf("parsing transcript: %w", err)
 	}
 
-	return calculateCost(usage), nil
+	return usage, calculateCost(usage), nil
 }
 
 // getTmuxSessionWorkDir gets the current working directory of a tmux session.
