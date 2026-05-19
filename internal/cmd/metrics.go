@@ -16,12 +16,14 @@ var (
 	metricsByActor bool
 	metricsSince   int
 	metricsDead    bool
+	metricsJSON    bool
 )
 
 func init() {
 	metricsCmd.Flags().BoolVar(&metricsByActor, "by-actor", false, "Show breakdown by actor")
 	metricsCmd.Flags().IntVar(&metricsSince, "since", 0, "Only show data from last N days")
 	metricsCmd.Flags().BoolVar(&metricsDead, "dead", false, "Show commands defined but never invoked")
+	metricsCmd.Flags().BoolVarP(&metricsJSON, "json", "j", false, "Output as JSON (mode-specific shape: frequency / by-actor / dead)")
 
 	rootCmd.AddCommand(metricsCmd)
 }
@@ -94,6 +96,10 @@ func readUsageLog() ([]usageEntry, error) {
 // showFrequency prints commands sorted by invocation count.
 func showFrequency(entries []usageEntry) error {
 	if len(entries) == 0 {
+		if metricsJSON {
+			fmt.Println("[]")
+			return nil
+		}
 		fmt.Println("No usage data.")
 		return nil
 	}
@@ -108,9 +114,9 @@ func showFrequency(entries []usageEntry) error {
 	}
 
 	type row struct {
-		cmd   string
-		count int
-		last  string
+		Cmd   string `json:"cmd"`
+		Count int    `json:"count"`
+		Last  string `json:"last_used"`
 	}
 	var rows []row
 	for cmd, count := range counts {
@@ -120,12 +126,21 @@ func showFrequency(entries []usageEntry) error {
 		}
 		rows = append(rows, row{cmd, count, last})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].count > rows[j].count })
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Count > rows[j].Count })
+
+	if metricsJSON {
+		out, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling frequency rows: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
 
 	fmt.Printf("%-35s %6s  %s\n", "COMMAND", "COUNT", "LAST USED")
 	fmt.Printf("%-35s %6s  %s\n", strings.Repeat("─", 35), strings.Repeat("─", 6), strings.Repeat("─", 10))
 	for _, r := range rows {
-		fmt.Printf("%-35s %6d  %s\n", r.cmd, r.count, r.last)
+		fmt.Printf("%-35s %6d  %s\n", r.Cmd, r.Count, r.Last)
 	}
 	fmt.Printf("\nTotal: %d invocations across %d commands\n", len(entries), len(counts))
 	return nil
@@ -134,6 +149,10 @@ func showFrequency(entries []usageEntry) error {
 // showByActor prints usage broken down by actor.
 func showByActor(entries []usageEntry) error {
 	if len(entries) == 0 {
+		if metricsJSON {
+			fmt.Println("{}")
+			return nil
+		}
 		fmt.Println("No usage data.")
 		return nil
 	}
@@ -153,6 +172,15 @@ func showByActor(entries []usageEntry) error {
 		actorNames = append(actorNames, a)
 	}
 	sort.Strings(actorNames)
+
+	if metricsJSON {
+		out, err := json.MarshalIndent(actors, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling by-actor map: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
 
 	for _, actor := range actorNames {
 		cmds := actors[actor]
@@ -198,6 +226,18 @@ func showDeadCommands(entries []usageEntry) error {
 	}
 
 	sort.Strings(dead)
+
+	if metricsJSON {
+		if dead == nil {
+			dead = []string{}
+		}
+		out, err := json.MarshalIndent(dead, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling dead commands: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
 
 	if len(dead) == 0 {
 		fmt.Println("No dead commands — every registered command has been invoked.")
