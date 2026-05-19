@@ -104,9 +104,26 @@ gt done                  # Submit and self-clean
 2. Run: `gt prime && bd prime`
 3. Check hook: `gt hook`
 4. If formula attached, steps are shown inline by `gt prime`
-5. Work through the checklist, then `gt done`
+5. **Branch-name fallback** (audit-v3.0:gastown-dogfood-cy3 — known bug):
+   If `gt hook` returns "Nothing on hook - no work slung" BUT your current
+   branch name matches `polecat/<your-name>/<bead-id>@<suffix>`, the bead
+   IS your assignment even if hook_bead is null in the agent bead.
+   Extract the bead ID and proceed:
+   ```bash
+   BRANCH=$(git branch --show-current)
+   # Parse bead ID from polecat/rust/ls-ia1@mpd3z9h3 → ls-ia1
+   BEAD=$(echo "$BRANCH" | sed -nE 's|^polecat/[^/]+/([^@]+)@.*|\1|p')
+   if [ -n "$BEAD" ]; then
+     bd show "$BEAD"            # Read the work spec
+     # Proceed with the work even though gt hook said nothing
+   fi
+   ```
+   This works around the hook_bead-not-written bug. The branch name is the
+   authoritative source of your assignment — the gastown spawn path encodes
+   the bead ID in the branch even when the agent-bead write fails.
+6. Work through the checklist, then `gt done`
 
-**If NO work on hook and NO mail:** run `gt done` immediately.
+**If NO work on hook AND NO branch-name bead AND NO mail:** run `gt done` immediately.
 
 **If your assigned bead has nothing to implement** (already done, can't reproduce, not applicable):
 ```bash
