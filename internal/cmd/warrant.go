@@ -18,10 +18,11 @@ import (
 
 // Warrant flags
 var (
-	warrantReason  string
-	warrantListAll bool
-	warrantForce   bool
-	warrantStdin   bool // Read reason from stdin
+	warrantReason   string
+	warrantListAll  bool
+	warrantListJSON bool
+	warrantForce    bool
+	warrantStdin    bool // Read reason from stdin
 )
 
 // Warrant represents a death warrant for an agent
@@ -108,6 +109,7 @@ func init() {
 
 	// List flags
 	warrantListCmd.Flags().BoolVarP(&warrantListAll, "all", "a", false, "Include executed warrants")
+	warrantListCmd.Flags().BoolVarP(&warrantListJSON, "json", "j", false, "Output as JSON array (empty array when no matches)")
 
 	// Execute flags
 	warrantExecuteCmd.Flags().BoolVarP(&warrantForce, "force", "f", false, "Execute even without a warrant")
@@ -219,6 +221,10 @@ func runWarrantList(cmd *cobra.Command, args []string) error {
 	entries, err := os.ReadDir(warrantDir)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if warrantListJSON {
+				fmt.Println("[]")
+				return nil
+			}
 			fmt.Println("No warrants filed")
 			return nil
 		}
@@ -244,6 +250,18 @@ func runWarrantList(cmd *cobra.Command, args []string) error {
 		if warrantListAll || !w.Executed {
 			warrants = append(warrants, w)
 		}
+	}
+
+	if warrantListJSON {
+		if warrants == nil {
+			warrants = []Warrant{}
+		}
+		out, err := json.MarshalIndent(warrants, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling warrants: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
 	}
 
 	if len(warrants) == 0 {
