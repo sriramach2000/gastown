@@ -77,7 +77,7 @@ Examples:
 
 func init() {
 	taxonomyCmd.Flags().BoolVarP(&taxonomyJSONFlag, "json", "j", false, "Output as JSON")
-	// NOTE: rootCmd.AddCommand(taxonomyCmd) is wired by the orchestrator after merge.
+	rootCmd.AddCommand(taxonomyCmd)
 }
 
 // runTaxonomyCmd is the cobra RunE handler for gt taxonomy.

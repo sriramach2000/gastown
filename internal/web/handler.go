@@ -555,8 +555,15 @@ func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (h
 	staticHandler := http.FileServer(http.FS(staticFS))
 
 	mux := http.NewServeMux()
+	// Specific /api/ paths must register BEFORE the generic /api/ catch-all
+	// so ServeMux's longest-match routing picks them.
+	mux.Handle("/api/taxonomy", NewTaxonomyHandler())
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/static/", http.StripPrefix("/static/", staticHandler))
+	// /events emits server-sent events for live dashboard updates.
+	// Production publisher emits no events yet (heartbeats only); witness/polecat
+	// lifecycle wiring is a follow-up.
+	mux.Handle("/events", NewSSEHandler(NewNoopPublisher(), 2*time.Second))
 	mux.Handle("/", convoyHandler)
 
 	// Warm the dashboard cache in the background so the first user-facing

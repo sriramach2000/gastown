@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -90,6 +91,15 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: loading town settings: %v (using defaults)\n", loadErr)
 		}
 
+		// Wire the taxonomy builder so /api/taxonomy can call BuildTaxonomy.
+		// Bridge between cmd.Taxonomy and web.TaxonomyResponse (identical fields).
+		web.SetTaxonomyBuilder(func(ctx context.Context, root string) (web.TaxonomyResponse, error) {
+			tx, txErr := BuildTaxonomy(ctx, root)
+			if txErr != nil {
+				return web.TaxonomyResponse{}, txErr
+			}
+			return taxonomyToWebResponse(tx), nil
+		})
 		handler, err = web.NewDashboardMux(fetcher, webCfg)
 		if err != nil {
 			return fmt.Errorf("creating dashboard handler: %w", err)
@@ -198,4 +208,23 @@ func openBrowser(url string) {
 		return
 	}
 	_ = cmd.Start()
+}
+
+// taxonomyToWebResponse converts cmd.Taxonomy to web.TaxonomyResponse.
+// Field shapes are identical; this is a structural copy.
+func taxonomyToWebResponse(t Taxonomy) web.TaxonomyResponse {
+	resp := web.TaxonomyResponse{
+		Mayor: web.TaxonomyMayorNode{ID: t.Mayor.ID, Status: t.Mayor.Status, Rig: t.Mayor.Rig},
+		Ts:    t.Ts,
+	}
+	for _, d := range t.Deacons {
+		resp.Deacons = append(resp.Deacons, web.TaxonomyDeaconNode{ID: d.ID, Status: d.Status, Supervises: d.Supervises})
+	}
+	for _, w := range t.Witnesses {
+		resp.Witnesses = append(resp.Witnesses, web.TaxonomyWitnessNode{ID: w.ID, Status: w.Status, Alerts: w.Alerts, Supervises: w.Supervises})
+	}
+	for _, p := range t.Polecats {
+		resp.Polecats = append(resp.Polecats, web.TaxonomyPolecatNode{ID: p.ID, Status: p.Status, HookBead: p.HookBead, Rig: p.Rig, Supervisor: p.Supervisor})
+	}
+	return resp
 }

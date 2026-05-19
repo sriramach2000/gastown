@@ -108,3 +108,24 @@ func writeSSEEvent(w http.ResponseWriter, eventType string, payload map[string]a
 	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
 	return err
 }
+
+// NoopPublisher is a production SSEPublisher that emits no events.
+// The handler still emits heartbeats on its own schedule. This is the
+// production wiring until a real event source (witness/polecat lifecycle)
+// is connected.
+type NoopPublisher struct{}
+
+// NewNoopPublisher returns a publisher that never emits events.
+// The returned channel stays open until the context is cancelled.
+func NewNoopPublisher() *NoopPublisher { return &NoopPublisher{} }
+
+// Subscribe returns a never-closing channel. The SSE handler treats this as
+// "no events arrive; emit heartbeats only".
+func (n *NoopPublisher) Subscribe(ctx context.Context) (<-chan SSEEvent, error) {
+	ch := make(chan SSEEvent)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
