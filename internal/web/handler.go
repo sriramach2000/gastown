@@ -86,6 +86,22 @@ func NewConvoyHandler(fetcher ConvoyFetcher, fetchTimeout time.Duration, csrfTok
 	}, nil
 }
 
+// WarmCache eagerly populates the dashboard cache in a background goroutine.
+// Call this once after constructing the handler if you want the first
+// user-facing request to hit a populated cache instead of paying the ~12s
+// cold-start penalty. Safe to call multiple times; concurrent calls are
+// serialized via cacheInUse.
+// Per operator directive 2026-05-19 (dashboard load slow on refresh).
+func (h *ConvoyHandler) WarmCache() {
+	go func() {
+		req, err := http.NewRequest(http.MethodGet, "/", nil)
+		if err != nil {
+			return
+		}
+		h.refreshCacheAsync(req, "")
+	}()
+}
+
 // ServeHTTP handles GET / requests and renders the convoy dashboard.
 // Uses a response cache to prevent bd process storms from overlapping
 // requests (htmx auto-refresh, multiple tabs). Only one fetch cycle
@@ -105,6 +121,21 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if _, err := w.Write(body); err != nil {
 				log.Printf("dashboard: cached response write failed: %v", err)
 			}
+			return
+		}
+		// Stale-while-revalidate: if we have ANY cached body (even stale),
+		// serve it instantly and refresh in the background. Eliminates the
+		// ~12s cache-miss penalty after TTL expiration. Per operator
+		// directive 2026-05-19 (dashboard load takes a LONG time on refresh).
+		if len(h.cacheBody) > 0 {
+			body := h.cacheBody
+			h.cacheMu.Unlock()
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			if _, err := w.Write(body); err != nil {
+				log.Printf("dashboard: stale cached response write failed: %v", err)
+			}
+			// Kick off async refresh so the next request gets fresh data.
+			go h.refreshCacheAsync(r, expandPanel)
 			return
 		}
 		h.cacheMu.Unlock()
@@ -179,6 +210,49 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if _, err := w.Write(body); err != nil {
 		log.Printf("dashboard: response write failed: %v", err)
+	}
+}
+
+// refreshCacheAsync re-fetches the dashboard in the background and updates
+// the cache. Called from the stale-while-revalidate path so subsequent
+// requests within the cache TTL get fresh data without the slow-first-load
+// penalty. Serialized by cacheInUse so concurrent stale requests don't
+// trigger duplicate background fetches.
+func (h *ConvoyHandler) refreshCacheAsync(r *http.Request, expandPanel string) {
+	// TryLock avoids piling up background refreshes if one is already running.
+	if !h.cacheInUse.TryLock() {
+		return
+	}
+	defer h.cacheInUse.Unlock()
+
+	// Re-check freshness after acquiring lock — another refresh may have
+	// landed between the stale-serve and the TryLock.
+	if expandPanel == "" {
+		h.cacheMu.Lock()
+		if len(h.cacheBody) > 0 && time.Since(h.cacheTime) < h.cacheTTL {
+			h.cacheMu.Unlock()
+			return
+		}
+		h.cacheMu.Unlock()
+	}
+
+	body := h.fetchAndRender(r, expandPanel)
+	if body == nil {
+		return // leave existing stale cache in place
+	}
+
+	if expandPanel == "" {
+		h.cacheMu.Lock()
+		h.cacheBody = body
+		h.cacheTime = time.Now()
+		h.cacheMu.Unlock()
+	} else {
+		h.expandCacheMu.Lock()
+		if h.expandCache == nil {
+			h.expandCache = make(map[string]expandCacheEntry)
+		}
+		h.expandCache[expandPanel] = expandCacheEntry{body: body, time: time.Now()}
+		h.expandCacheMu.Unlock()
 	}
 }
 
@@ -484,6 +558,11 @@ func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (h
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/static/", http.StripPrefix("/static/", staticHandler))
 	mux.Handle("/", convoyHandler)
+
+	// Warm the dashboard cache in the background so the first user-facing
+	// request hits a populated cache instead of paying the ~12s cold-start
+	// penalty. Per operator directive 2026-05-19.
+	convoyHandler.WarmCache()
 
 	return mux, nil
 }
