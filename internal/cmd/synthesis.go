@@ -19,10 +19,11 @@ import (
 
 // Synthesis command flags
 var (
-	synthesisRig      string
-	synthesisDryRun   bool
-	synthesisForce    bool
-	synthesisReviewID string
+	synthesisRig        string
+	synthesisDryRun     bool
+	synthesisForce      bool
+	synthesisReviewID   string
+	synthesisStatusJSON bool
 )
 
 var synthesisCmd = &cobra.Command{
@@ -97,6 +98,9 @@ func init() {
 	synthesisStartCmd.Flags().BoolVar(&synthesisDryRun, "dry-run", false, "Preview execution")
 	synthesisStartCmd.Flags().BoolVar(&synthesisForce, "force", false, "Start even if legs incomplete")
 	synthesisStartCmd.Flags().StringVar(&synthesisReviewID, "review-id", "", "Override review ID")
+
+	// Status flags
+	synthesisStatusCmd.Flags().BoolVarP(&synthesisStatusJSON, "json", "j", false, "Output as JSON (convoy readiness)")
 
 	// Add subcommands
 	synthesisCmd.AddCommand(synthesisStartCmd)
@@ -263,6 +267,69 @@ func runSynthesisStatus(cmd *cobra.Command, args []string) error {
 	legOutputs, allComplete, err := collectLegOutputs(meta, f)
 	if err != nil {
 		return fmt.Errorf("collecting leg outputs: %w", err)
+	}
+
+	// JSON emit branch (per audit-v3.0:B-SYNTHESIS-04 + B-SYNTHESIS-05).
+	// Previously text-only; lockstep's status_synthesis() couldn't parse
+	// anything and always returned None. NOTE: payload returned here is
+	// CONVOY-READINESS (no synthesis bead yet); the lockstep adapter's
+	// SynthesisInfo dataclass expects a STARTED synthesis (id, started_at).
+	// Mismatch tracked in the separate "synthesis fantasy contract" ticket.
+	if synthesisStatusJSON {
+		type legJSON struct {
+			LegID    string `json:"leg_id"`
+			Title    string `json:"title"`
+			Status   string `json:"status"`
+			HasFile  bool   `json:"has_file"`
+			FilePath string `json:"file_path,omitempty"`
+		}
+		legs := make([]legJSON, 0, len(legOutputs))
+		completedCount := 0
+		for _, leg := range legOutputs {
+			if leg.Status == "closed" {
+				completedCount++
+			}
+			legs = append(legs, legJSON{
+				LegID:    leg.LegID,
+				Title:    leg.Title,
+				Status:   leg.Status,
+				HasFile:  leg.HasFile,
+				FilePath: leg.FilePath,
+			})
+		}
+		out := struct {
+			ConvoyID       string    `json:"convoy_id"`
+			Title          string    `json:"title"`
+			Status         string    `json:"status"`
+			Formula        string    `json:"formula,omitempty"`
+			Legs           []legJSON `json:"legs"`
+			Ready          bool      `json:"ready"`
+			CompletedLegs  int       `json:"completed_legs"`
+			TotalLegs      int       `json:"total_legs"`
+			SynthesisTitle string    `json:"synthesis_title,omitempty"`
+			SynthesisOut   string    `json:"synthesis_output_path,omitempty"`
+		}{
+			ConvoyID:      convoyID,
+			Title:         meta.Title,
+			Status:        meta.Status,
+			Formula:       meta.Formula,
+			Legs:          legs,
+			Ready:         allComplete,
+			CompletedLegs: completedCount,
+			TotalLegs:     len(legOutputs),
+		}
+		if f != nil && f.Synthesis != nil {
+			out.SynthesisTitle = f.Synthesis.Title
+			if f.Output != nil {
+				out.SynthesisOut = f.Output.Synthesis
+			}
+		}
+		b, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling synthesis status: %w", err)
+		}
+		fmt.Println(string(b))
+		return nil
 	}
 
 	// Display status
