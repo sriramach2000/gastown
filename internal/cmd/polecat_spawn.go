@@ -148,11 +148,26 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		}
 	}
 
+	// Per-job-worktree gate: only attempt reuse when scheduler.allow_polecat_reuse=true.
+	// Default (absent/false) skips the idle-polecat lookup entirely — every sling
+	// allocates a fresh polecat + fresh worktree, and the worktree is destroyed on
+	// done/DEFERRED. This eliminates cross-bead session-state leakage at the cost
+	// of ~5s worktree-create overhead per sling.
+	// Flip back: gt config set scheduler.allow_polecat_reuse true
+	reuseAllowed := false
+	{
+		settingsPath := config.TownSettingsPath(townRoot)
+		if ts, tsErr := config.LoadOrCreateTownSettings(settingsPath); tsErr == nil && ts != nil && ts.Scheduler != nil {
+			reuseAllowed = ts.Scheduler.IsPolecatReuseAllowed()
+		}
+	}
+
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
 	// Idle polecats have completed their work but kept their sandbox (worktree).
 	// Reusing avoids the overhead of creating a new worktree.
+	// Gated by scheduler.allow_polecat_reuse (default: false — per-job-worktree model).
 	idlePolecat, findErr := polecatMgr.FindIdlePolecat()
-	if findErr == nil && idlePolecat != nil {
+	if reuseAllowed && findErr == nil && idlePolecat != nil {
 		polecatName := idlePolecat.Name
 		fmt.Printf("Reusing idle polecat: %s\n", polecatName)
 
