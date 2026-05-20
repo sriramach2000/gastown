@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/agent"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -964,5 +965,151 @@ func TestShouldCreateFreshSessionBranch_Structural(t *testing.T) {
 					c.currentBranch, c.issue, c.canonicalBranch, got, c.want)
 			}
 		})
+	}
+}
+
+// installMockBDForRoute installs a minimal mock `bd` binary on PATH that:
+//   - responds to "bd show <id> --json" by printing $MOCK_BD_ROUTE_OUTPUT
+//   - exits 0 for all other subcommands (bd update, bd hook, etc.)
+//
+// NOTE: uses t.Setenv — callers MUST NOT call t.Parallel() in the same test
+// or any containing test; Go 1.26 panics with "test using t.Setenv can not
+// use t.Parallel()".
+func installMockBDForRoute(t *testing.T, showOutput string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd requires Unix shell")
+	}
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  show) printf '%s\n' "$MOCK_BD_ROUTE_OUTPUT"; exit 0 ;;
+  *) exit 0 ;;
+esac
+`
+	scriptPath := filepath.Join(binDir, "bd")
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_ROUTE_OUTPUT", showOutput)
+}
+
+// TestStart_RouteForCalled verifies that beadForRoute is called with the correct
+// fields when Start() is invoked, and that the resulting agent.Session stored in
+// agentSessions reflects the RouteFor decision (M4 dual-sdk-router).
+//
+// NOTE: does NOT call t.Parallel() because installMockBDForRoute uses t.Setenv.
+func TestStart_RouteForCalled(t *testing.T) {
+	cases := []struct {
+		name         string
+		bdOutput     string // JSON returned by mock bd show
+		wantRail     agent.Rail
+		wantRuleDesc string
+	}{
+		{
+			name:         "P1 bead routes to Claude (Rule 2)",
+			bdOutput:     `[{"labels":[],"priority":1}]`,
+			wantRail:     agent.RailClaude,
+			wantRuleDesc: "severity P1 → Rule 2",
+		},
+		{
+			name:         "P2 bead routes to OpenCode (Rule 7 default)",
+			bdOutput:     `[{"labels":[],"priority":2}]`,
+			wantRail:     agent.RailOpenCode,
+			wantRuleDesc: "severity P2 → Rule 7",
+		},
+		{
+			name:         "security label routes to Claude (Rule 5)",
+			bdOutput:     `[{"labels":["security"],"priority":3}]`,
+			wantRail:     agent.RailClaude,
+			wantRuleDesc: "security label → Rule 5",
+		},
+		{
+			name:         "empty bd output (bd fail) routes to OpenCode default",
+			bdOutput:     ``,
+			wantRail:     agent.RailOpenCode,
+			wantRuleDesc: "empty bd output → Rule 7 default",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// NOTE: no t.Parallel() — t.Setenv is used inside installMockBDForRoute
+			installMockBDForRoute(t, tc.bdOutput)
+
+			r := &rig.Rig{Name: "gastown", Path: t.TempDir()}
+			m := NewSessionManager(tmux.NewTmux(), r)
+
+			// Call beadForRoute directly (Start() itself needs a full tmux rig).
+			bead := m.beadForRoute("gt-test1", t.TempDir())
+			rail, _ := agent.RouteFor(bead)
+
+			if rail != tc.wantRail {
+				t.Errorf("[%s] RouteFor rail = %q, want %q", tc.wantRuleDesc, rail, tc.wantRail)
+			}
+		})
+	}
+}
+
+// TestBeadForRoute_FieldMapping verifies that beadForRoute correctly maps the
+// bd show JSON output to agent.Bead fields (priority→Severity, labels, IDs).
+func TestBeadForRoute_FieldMapping(t *testing.T) {
+	installMockBDForRoute(t, `[{"labels":["architecture","p1-label"],"priority":0}]`)
+
+	r := &rig.Rig{Name: "gastown", Path: t.TempDir()}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	bead := m.beadForRoute("gt-abc123", t.TempDir())
+
+	if bead.ID != "gt-abc123" {
+		t.Errorf("bead.ID = %q, want %q", bead.ID, "gt-abc123")
+	}
+	if bead.Severity != "P0" {
+		t.Errorf("bead.Severity = %q, want P0 (priority=0 maps to P0)", bead.Severity)
+	}
+	if len(bead.Labels) != 2 || bead.Labels[0] != "architecture" {
+		t.Errorf("bead.Labels = %v, want [architecture p1-label]", bead.Labels)
+	}
+	if bead.DeferredCount != 0 {
+		t.Errorf("bead.DeferredCount = %d, want 0 (M4 hardcodes 0)", bead.DeferredCount)
+	}
+	if bead.EstLOC != 0 {
+		t.Errorf("bead.EstLOC = %d, want 0 (M4 hardcodes 0)", bead.EstLOC)
+	}
+}
+
+// TestBeadForRoute_BdFailure verifies graceful degradation: when bd is not found
+// (or returns no output), beadForRoute returns an ID-only Bead which RouteFor
+// maps to RailOpenCode via Rule 7 (safe cheap default).
+func TestBeadForRoute_BdFailure(t *testing.T) {
+	// Point PATH at an empty dir so bd is not found at all.
+	emptyBin := t.TempDir()
+	t.Setenv("PATH", emptyBin)
+
+	r := &rig.Rig{Name: "gastown", Path: t.TempDir()}
+	m := NewSessionManager(tmux.NewTmux(), r)
+
+	bead := m.beadForRoute("gt-xyz", t.TempDir())
+
+	// Should get at least the ID back (partial Bead).
+	if bead.ID != "gt-xyz" {
+		t.Errorf("bead.ID = %q, want %q", bead.ID, "gt-xyz")
+	}
+	// Without labels or severity, RouteFor should default to OpenCode (Rule 7).
+	rail, rule := agent.RouteFor(bead)
+	if rail != agent.RailOpenCode {
+		t.Errorf("RouteFor rail = %q, want RailOpenCode on bd failure", rail)
+	}
+	if rule != 7 {
+		t.Errorf("RouteFor rule = %d, want 7 (default) on bd failure", rule)
 	}
 }

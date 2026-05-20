@@ -635,16 +635,31 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
 		"polecat", polecat, sessionID, m.rig.Name, townRoot, opts.Issue, workDir)
 
-	// M1 dual-SDK wiring: create an agent.Session for this polecat and store it
-	// so the M3 router can dispatch lifecycle calls through the interface.
-	// For M1 the Session wraps the same tmux session already managed above —
-	// behavior is byte-identical. The router replaces this call in M3.
-	if agentSess, err := agent.New(agent.RailClaude, agent.StartOptions{
+	// M4 dual-SDK wiring: use RouteFor to select the rail dynamically based on
+	// the bead's classifier inputs (severity, labels, deferred history).
+	// If no issue is set, bead defaults to all-zero → RailOpenCode (cheap default).
+	// If RouteFor selects RailOpenCode but that rail is unavailable, fall back
+	// to RailClaude so the polecat still gets a session (ADR §6 F3 mitigation).
+	routeBead := m.beadForRoute(opts.Issue, workDir)
+	rail, ruleNum := agent.RouteFor(routeBead)
+	fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s rail=%s rule=%d\n", routeBead.ID, rail, ruleNum)
+	agentSess, sessErr := agent.New(rail, agent.StartOptions{
 		PolecatName: polecat,
 		Rig:         m.rig.Name,
 		WorkDir:     workDir,
 		BeadID:      opts.Issue,
-	}); err == nil {
+	})
+	if sessErr != nil && rail == agent.RailOpenCode {
+		// OpenCode rail unavailable — fall back to Claude so the polecat still spawns.
+		fmt.Fprintf(os.Stderr, "[polecat-spawn] RailOpenCode unavailable (%v); falling back to RailClaude\n", sessErr)
+		agentSess, sessErr = agent.New(agent.RailClaude, agent.StartOptions{
+			PolecatName: polecat,
+			Rig:         m.rig.Name,
+			WorkDir:     workDir,
+			BeadID:      opts.Issue,
+		})
+	}
+	if sessErr == nil {
 		m.agentSessions[polecat] = agentSess
 	}
 
@@ -983,6 +998,54 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 	if m.tmux.IsIdle(sessionID) {
 		fmt.Fprintf(os.Stderr, "[startup-nudge] WARNING: agent %s still idle after %d nudge retries\n",
 			sessionID, maxRetries)
+	}
+}
+
+// beadForRoute fetches the minimal bead fields needed by agent.RouteFor.
+// If issueID is empty or the bd show call fails, an empty Bead is returned —
+// the classifier will default to RailOpenCode (safe cheap default, ADR §5 Rule 7).
+//
+// DeferredCount is hardcoded to 0 for M4; a full history query is deferred to M5
+// because it requires reading multiple bd history entries per bead.
+// TODO: M5 compute DeferredCount from bd history (count DEFERRED exit-type entries).
+func (m *SessionManager) beadForRoute(issueID, fallbackDir string) agent.Bead {
+	if issueID == "" {
+		return agent.Bead{} // no issue slung → OpenCode default (Rule 7)
+	}
+
+	bdWorkDir := m.resolveBeadsDir(issueID, fallbackDir)
+
+	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bd", "show", issueID, "--json") //nolint:gosec // G204: bd is a trusted internal tool
+	util.SetDetachedProcessGroup(cmd)
+	cmd.Dir = bdWorkDir
+	output, err := cmd.Output()
+	if err != nil {
+		debugSession("beadForRoute bd show", err)
+		return agent.Bead{ID: issueID} // fall back to ID-only → OpenCode default
+	}
+
+	var issues []struct {
+		Labels   []string `json:"labels"`
+		Priority int      `json:"priority"`
+	}
+	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
+		debugSession("beadForRoute parse", err)
+		return agent.Bead{ID: issueID}
+	}
+
+	issue := issues[0]
+	// Convert numeric priority (0=critical, 1=P1, 2=P2, …) to the severity string
+	// the classifier expects ("P0", "P1", "P2", …). See complexity.go highSeverities.
+	severity := fmt.Sprintf("P%d", issue.Priority)
+
+	return agent.Bead{
+		ID:            issueID,
+		Labels:        issue.Labels,
+		Severity:      severity,
+		DeferredCount: 0, // TODO: M5 compute from bd history
+		EstLOC:        0, // TODO: M5 wire est_loc from bead acceptance criteria heuristic
 	}
 }
 
