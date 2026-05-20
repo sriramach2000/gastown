@@ -807,13 +807,28 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	b := beads.New(rigBeadsRoot(ctx))
 
 	// Agent bead's hook_bead field. NOTE: updateAgentHookBead was made a no-op
-	// (see sling_helpers.go), so HookBead is typically empty. Kept for backward
-	// compatibility with agent beads that still have hook_bead set.
+	// (see sling_helpers.go), so agent bead hook_bead is set once at spawn time
+	// by createAgentBeadWithRetry and not updated afterward.
+	//
+	// Agent beads live in the TOWN database, not the rig database. Previously
+	// this used ResolveHookDir which routes rig-prefixed IDs (pp-*, ls-*, etc.)
+	// to the rig DB — so ab.Show always returned "not found", silently making
+	// the hook_bead path dead code and falling through to the assignee fallback
+	// every time. Fix: use ForAgentBead() which bypasses prefix routing and
+	// always reads from town/.beads. (gastown-dogfood-cy3)
 	agentBeadID := buildAgentBeadID(agentID, ctx.Role, ctx.TownRoot)
 	if agentBeadID != "" {
-		agentBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBeadID, ctx.WorkDir)
-		ab := beads.New(agentBeadDir)
-		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
+		ab := beads.New(ctx.WorkDir).ForAgentBead()
+		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil {
+			// gastown-dogfood-cy3 band-aid: writer path (polecat.AllocateAndAdd) currently
+			// only writes hook_bead into the agent bead's description text, not the top-level
+			// column. Fall back to parsing the description when the column is empty.
+			if agentBead.HookBead == "" {
+				if parsed := beads.ParseAgentFields(agentBead.Description); parsed.HookBead != "" {
+					agentBead.HookBead = parsed.HookBead
+				}
+			}
+			if agentBead.HookBead != "" {
 			hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
 			hb := beads.New(hookBeadDir)
 			hookBead, showErr := hb.Show(agentBead.HookBead)
@@ -829,6 +844,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 			if hookBead == nil || isBeadNotFound(showErr) {
 				return nil, fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
 					ErrHookUnresolvable, agentID, agentBead.HookBead, ctx.WorkDir, showErr)
+			}
 			}
 		}
 	}
