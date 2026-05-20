@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1292,6 +1293,120 @@ func TestConvoyHandler_NonFatalErrors(t *testing.T) {
 		t.Error("Response should contain convoy data even when other fetches fail")
 	}
 }
+
+// TestConvoyHandler_RefreshInFlightGuard verifies that two concurrent background
+// refresh calls do NOT both run fetchAndRender (gastown-dogfood-ys4).
+// If the in-flight guard is absent, slow bd queries pile up as zombie
+// subprocesses; this test detects the guard failing by counting how many
+// times the fetcher is actually invoked during overlapping refresh cycles.
+func TestConvoyHandler_RefreshInFlightGuard(t *testing.T) {
+	// blockCh lets us hold the first refresh inside fetchAndRender so the
+	// second concurrent call arrives while the first is still running.
+	blockCh := make(chan struct{}, 1)
+	releaseCh := make(chan struct{})
+
+	fetchCount := 0
+	var fetchMu sync.Mutex
+
+	inner := &MockConvoyFetcher{Convoys: []ConvoyRow{{ID: "hq-cv-guard", Status: "open"}}}
+	blocking := &blockingFetcher{
+		inner:     inner,
+		blockCh:   blockCh,
+		releaseCh: releaseCh,
+		onFetch: func() {
+			fetchMu.Lock()
+			fetchCount++
+			fetchMu.Unlock()
+		},
+	}
+
+	handler, err := NewConvoyHandler(blocking, 8*time.Second, "test-token")
+	if err != nil {
+		t.Fatalf("NewConvoyHandler() error = %v", err)
+	}
+	handler.cacheTTL = 0 // always stale so refreshes always proceed
+
+	// Seed the cache so the stale-while-revalidate path fires background refreshes.
+	handler.cacheMu.Lock()
+	handler.cacheBody = []byte("<html>stale</html>")
+	handler.cacheTime = time.Now().Add(-1 * time.Minute)
+	handler.cacheMu.Unlock()
+
+	// First refresh: starts, blocks inside FetchConvoys.
+	done1 := make(chan struct{})
+	req1, _ := http.NewRequest(http.MethodGet, "/", nil)
+	go func() {
+		defer close(done1)
+		handler.refreshCacheAsync(req1, "")
+	}()
+
+	// Wait until first refresh is inside FetchConvoys.
+	select {
+	case <-blockCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first refresh never reached FetchConvoys")
+	}
+
+	// Second refresh fires while first is still blocked.
+	req2, _ := http.NewRequest(http.MethodGet, "/", nil)
+	handler.refreshCacheAsync(req2, "") // must return immediately (guard fires)
+
+	// Let first refresh complete.
+	close(releaseCh)
+	select {
+	case <-done1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first refresh did not complete")
+	}
+
+	fetchMu.Lock()
+	got := fetchCount
+	fetchMu.Unlock()
+
+	if got != 1 {
+		t.Errorf("fetchCount = %d, want 1 — in-flight guard should block second refresh", got)
+	}
+}
+
+// blockingFetcher wraps a ConvoyFetcher; its FetchConvoys blocks on releaseCh
+// and signals blockCh when it arrives, enabling deterministic concurrency tests.
+type blockingFetcher struct {
+	inner     ConvoyFetcher
+	blockCh   chan struct{} // buffered; receives a value when FetchConvoys is entered
+	releaseCh chan struct{} // closed to let FetchConvoys return
+	onFetch   func()
+}
+
+func (b *blockingFetcher) FetchConvoys() ([]ConvoyRow, error) {
+	if b.onFetch != nil {
+		b.onFetch()
+	}
+	// Signal that we are inside FetchConvoys (non-blocking send so only first fires).
+	select {
+	case b.blockCh <- struct{}{}:
+	default:
+	}
+	// Block until released.
+	<-b.releaseCh
+	return b.inner.FetchConvoys()
+}
+func (b *blockingFetcher) FetchMergeQueue() ([]MergeQueueRow, error) {
+	return b.inner.FetchMergeQueue()
+}
+func (b *blockingFetcher) FetchWorkers() ([]WorkerRow, error)     { return b.inner.FetchWorkers() }
+func (b *blockingFetcher) FetchMail() ([]MailRow, error)          { return b.inner.FetchMail() }
+func (b *blockingFetcher) FetchRigs() ([]RigRow, error)           { return b.inner.FetchRigs() }
+func (b *blockingFetcher) FetchDogs() ([]DogRow, error)           { return b.inner.FetchDogs() }
+func (b *blockingFetcher) FetchEscalations() ([]EscalationRow, error) {
+	return b.inner.FetchEscalations()
+}
+func (b *blockingFetcher) FetchHealth() (*HealthRow, error)      { return b.inner.FetchHealth() }
+func (b *blockingFetcher) FetchQueues() ([]QueueRow, error)      { return b.inner.FetchQueues() }
+func (b *blockingFetcher) FetchSessions() ([]SessionRow, error)  { return b.inner.FetchSessions() }
+func (b *blockingFetcher) FetchHooks() ([]HookRow, error)        { return b.inner.FetchHooks() }
+func (b *blockingFetcher) FetchMayor() (*MayorStatus, error)     { return b.inner.FetchMayor() }
+func (b *blockingFetcher) FetchIssues() ([]IssueRow, error)      { return b.inner.FetchIssues() }
+func (b *blockingFetcher) FetchActivity() ([]ActivityRow, error) { return b.inner.FetchActivity() }
 
 // TestFetchCircuitBreaker verifies exponential backoff on consecutive failures (GH#3117).
 func TestFetchCircuitBreaker(t *testing.T) {

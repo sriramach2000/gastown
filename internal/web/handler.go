@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -64,6 +65,14 @@ type ConvoyHandler struct {
 	// See GH#3117.
 	expandCacheMu sync.Mutex
 	expandCache   map[string]expandCacheEntry
+
+	// fetchInFlight guards the background refresh path so that if a previous
+	// refreshCacheAsync call is still executing its 14-parallel-fetcher round,
+	// a newly-triggered background refresh skips immediately instead of
+	// spawning a second ConvoyFetcher round. Without this guard, slow bd
+	// queries (>5 s) under dashboard polling load can accumulate hundreds of
+	// zombie bd subprocesses within minutes (gastown-dogfood-ys4).
+	fetchInFlight atomic.Bool
 }
 
 // defaultCacheTTL is the minimum interval between full dashboard fetches.
@@ -216,17 +225,23 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // refreshCacheAsync re-fetches the dashboard in the background and updates
 // the cache. Called from the stale-while-revalidate path so subsequent
 // requests within the cache TTL get fresh data without the slow-first-load
-// penalty. Serialized by cacheInUse so concurrent stale requests don't
-// trigger duplicate background fetches.
+// penalty.
+//
+// The fetchInFlight guard ensures that if a previous refresh round is still
+// executing its 14-parallel-fetcher cycle (each spawning bd subprocesses),
+// the new call skips immediately rather than stacking up another round of
+// subprocesses. This is the primary defence against zombie bd storms when
+// bd queries are slow under load (gastown-dogfood-ys4).
 func (h *ConvoyHandler) refreshCacheAsync(r *http.Request, expandPanel string) {
-	// TryLock avoids piling up background refreshes if one is already running.
-	if !h.cacheInUse.TryLock() {
+	// CompareAndSwap: only one background refresh runs at a time.
+	// If a previous fetchAndRender is still in flight, skip this cycle.
+	if !h.fetchInFlight.CompareAndSwap(false, true) {
 		return
 	}
-	defer h.cacheInUse.Unlock()
+	defer h.fetchInFlight.Store(false)
 
-	// Re-check freshness after acquiring lock — another refresh may have
-	// landed between the stale-serve and the TryLock.
+	// Re-check freshness after setting the flag — another refresh may have
+	// landed between the stale-serve and the CompareAndSwap.
 	if expandPanel == "" {
 		h.cacheMu.Lock()
 		if len(h.cacheBody) > 0 && time.Since(h.cacheTime) < h.cacheTTL {
