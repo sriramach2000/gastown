@@ -576,9 +576,12 @@ func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (h
 	mux.Handle("/api/", apiHandler)
 	mux.Handle("/static/", http.StripPrefix("/static/", staticHandler))
 	// /events emits server-sent events for live dashboard updates.
-	// Production publisher emits no events yet (heartbeats only); witness/polecat
-	// lifecycle wiring is a follow-up.
-	mux.Handle("/events", NewSSEHandler(NewNoopPublisher(), 2*time.Second))
+	// WitnessSSEPublisher tails <town>/.events.jsonl via fsnotify and broadcasts
+	// polecat lifecycle events (spawned, hooked, working, done) to all subscribers.
+	// Falls back to NoopPublisher (heartbeats only) when the town root cannot be
+	// discovered from cwd (e.g., tests without a workspace).
+	sseCtx := context.Background()
+	mux.Handle("/events", NewSSEHandler(NewWitnessSSEPublisherAutoDiscover(sseCtx), 30*time.Second))
 	mux.Handle("/", convoyHandler)
 
 	// Warm the dashboard cache in the background so the first user-facing

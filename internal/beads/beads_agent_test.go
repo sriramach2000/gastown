@@ -547,3 +547,73 @@ esac
 		t.Fatalf("CreateOrReopenAgentBead did not use town BEADS_DIR for existing bead path; log:\n%s", logOutput)
 	}
 }
+
+// TestParseAgentFields_RailFields verifies that the four dual-SDK router
+// telemetry fields (ADR §5.2, M5) round-trip correctly through
+// FormatAgentDescription → ParseAgentFields.
+func TestParseAgentFields_RailFields(t *testing.T) {
+	tests := []struct {
+		name          string
+		rail          string
+		railReason    string
+		totalCostUSD  float64
+		escalatedFrom string
+	}{
+		{
+			name:         "opencode default rail no escalation",
+			rail:         "opencode",
+			railReason:   "default: no classifier rule matched",
+			totalCostUSD: 0.08,
+		},
+		{
+			name:          "claude rail with escalation from opencode",
+			rail:          "claude",
+			railReason:    "rule 3: bead DEFERRED once by polecat",
+			totalCostUSD:  0.42,
+			escalatedFrom: "opencode",
+		},
+		{
+			name:         "claude rail P1 severity no escalation",
+			rail:         "claude",
+			railReason:   "rule 2: bead severity P1",
+			totalCostUSD: 1.23456789,
+		},
+		{
+			name: "zero cost in-flight polecat (fields absent in formatted output)",
+			rail: "opencode",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			original := &AgentFields{
+				RoleType:      "polecat",
+				Rig:           "gastown",
+				AgentState:    "working",
+				Rail:          tc.rail,
+				RailReason:    tc.railReason,
+				TotalCostUSD:  tc.totalCostUSD,
+				EscalatedFrom: tc.escalatedFrom,
+			}
+
+			desc := FormatAgentDescription("polecat Toast", original)
+			parsed := ParseAgentFields(desc)
+
+			if parsed.Rail != tc.rail {
+				t.Errorf("Rail = %q, want %q", parsed.Rail, tc.rail)
+			}
+			if parsed.RailReason != tc.railReason {
+				t.Errorf("RailReason = %q, want %q", parsed.RailReason, tc.railReason)
+			}
+			// Float comparison with tolerance for serialisation rounding.
+			const tol = 1e-9
+			diff := parsed.TotalCostUSD - tc.totalCostUSD
+			if diff > tol || diff < -tol {
+				t.Errorf("TotalCostUSD = %v, want %v", parsed.TotalCostUSD, tc.totalCostUSD)
+			}
+			if parsed.EscalatedFrom != tc.escalatedFrom {
+				t.Errorf("EscalatedFrom = %q, want %q", parsed.EscalatedFrom, tc.escalatedFrom)
+			}
+		})
+	}
+}

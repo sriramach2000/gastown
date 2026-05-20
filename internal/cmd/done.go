@@ -1367,6 +1367,19 @@ notifyWitness:
 			PushFailed:     pushFailed,
 			CompletionTime: time.Now().UTC().Format(time.RFC3339),
 		}
+		// Dual-SDK router telemetry (ADR §5.2, M5).
+		// GT_TOTAL_COST_USD is injected by the session manager when the SDK
+		// session terminates (M4 ResultMessage integration). When not set (pre-M4
+		// or non-SDK rails), the cost is left at zero and silently omitted.
+		if rawCost := os.Getenv("GT_TOTAL_COST_USD"); rawCost != "" {
+			if cost, parseErr := strconv.ParseFloat(rawCost, 64); parseErr == nil && cost > 0 {
+				meta.TotalCostUSD = cost
+			}
+		}
+		// GT_ESCALATED_FROM is set by the session manager when this polecat was
+		// respawned onto the Claude rail after a DEFERRED on another rail (ADR §5.1 rule 3).
+		meta.EscalatedFrom = os.Getenv("GT_ESCALATED_FROM")
+
 		if err := completionBd.UpdateAgentCompletion(agentBeadID, meta); err != nil {
 			style.PrintWarning("could not write completion metadata to agent bead: %v", err)
 		}

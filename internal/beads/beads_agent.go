@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gofrs/flock"
@@ -56,6 +57,14 @@ type AgentFields struct {
 	MRFailed       bool   // True when MR creation was attempted but failed
 	PushFailed     bool   // True when branch push to origin failed (gas-556)
 	CompletionTime string // RFC3339 timestamp of when gt done was called
+
+	// Dual-SDK router telemetry fields (ADR §5.2, M5).
+	// Written at polecat spawn (rail + rail_reason) and gt done (total_cost_usd + escalated_from).
+	// gt rail-stats aggregates these fields for weekly escalation-rate tracking.
+	Rail          string  // "claude" | "opencode" — rail chosen by the complexity classifier
+	RailReason    string  // human-readable reason from classifier rule match
+	TotalCostUSD  float64 // cumulative cost (USD) across the polecat's life on this rail
+	EscalatedFrom string  // prior rail when a DEFERRED bead was promoted (e.g., "opencode")
 }
 
 // Notification level constants
@@ -134,6 +143,20 @@ func FormatAgentDescription(title string, fields *AgentFields) string {
 		lines = append(lines, fmt.Sprintf("completion_time: %s", fields.CompletionTime))
 	}
 
+	// Dual-SDK router telemetry fields (ADR §5.2, M5)
+	if fields.Rail != "" {
+		lines = append(lines, fmt.Sprintf("rail: %s", fields.Rail))
+	}
+	if fields.RailReason != "" {
+		lines = append(lines, fmt.Sprintf("rail_reason: %s", fields.RailReason))
+	}
+	if fields.TotalCostUSD != 0 {
+		lines = append(lines, fmt.Sprintf("total_cost_usd: %s", strconv.FormatFloat(fields.TotalCostUSD, 'f', -1, 64)))
+	}
+	if fields.EscalatedFrom != "" {
+		lines = append(lines, fmt.Sprintf("escalated_from: %s", fields.EscalatedFrom))
+	}
+
 	return strings.Join(lines, "\n")
 }
 
@@ -188,6 +211,17 @@ func ParseAgentFields(description string) *AgentFields {
 			fields.PushFailed = value == "true"
 		case "completion_time":
 			fields.CompletionTime = value
+		// Dual-SDK router telemetry fields (ADR §5.2, M5)
+		case "rail":
+			fields.Rail = value
+		case "rail_reason":
+			fields.RailReason = value
+		case "total_cost_usd":
+			if v, err := strconv.ParseFloat(value, 64); err == nil {
+				fields.TotalCostUSD = v
+			}
+		case "escalated_from":
+			fields.EscalatedFrom = value
 		}
 	}
 
@@ -370,6 +404,9 @@ func (b *Beads) ResetAgentBeadForReuse(id, reason string) error {
 	fields.Branch = ""
 	fields.MRFailed = false
 	fields.CompletionTime = ""
+	// Clear dual-SDK router telemetry (ADR §5.2, M5) — written fresh at next spawn.
+	fields.TotalCostUSD = 0
+	fields.EscalatedFrom = ""
 
 	// Update description with cleared fields
 	description := FormatAgentDescription(issue.Title, fields)
@@ -417,6 +454,11 @@ type AgentFieldUpdates struct {
 	MRFailed       *bool
 	PushFailed     *bool // True when branch push to origin failed (gas-556)
 	CompletionTime *string
+	// Dual-SDK router telemetry fields (ADR §5.2, M5)
+	Rail          *string
+	RailReason    *string
+	TotalCostUSD  *float64
+	EscalatedFrom *string
 }
 
 // UpdateAgentDescriptionFields atomically updates one or more agent description
@@ -489,6 +531,19 @@ func (b *Beads) UpdateAgentDescriptionFields(id string, updates AgentFieldUpdate
 	if updates.CompletionTime != nil {
 		fields.CompletionTime = *updates.CompletionTime
 	}
+	// Dual-SDK router telemetry fields (ADR §5.2, M5)
+	if updates.Rail != nil {
+		fields.Rail = *updates.Rail
+	}
+	if updates.RailReason != nil {
+		fields.RailReason = *updates.RailReason
+	}
+	if updates.TotalCostUSD != nil {
+		fields.TotalCostUSD = *updates.TotalCostUSD
+	}
+	if updates.EscalatedFrom != nil {
+		fields.EscalatedFrom = *updates.EscalatedFrom
+	}
 
 	description := FormatAgentDescription(issue.Title, fields)
 	return b.Update(id, UpdateOptions{Description: &description})
@@ -520,35 +575,54 @@ func (b *Beads) UpdateAgentNotificationLevel(id string, level string) error {
 // step reads these fields to discover completion state from beads
 // instead of POLECAT_DONE mail (nudge-over-mail redesign, gt-x7t9).
 type CompletionMetadata struct {
-	ExitType       string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE
-	MRID           string // MR bead ID (empty if no MR)
-	Branch         string // Polecat working branch
-	HookBead       string // The work bead ID
-	MRFailed       bool   // True when MR creation was attempted but failed
-	PushFailed     bool   // True when branch push to origin failed (gas-556)
-	CompletionTime string // RFC3339 timestamp
+	ExitType       string  // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE
+	MRID           string  // MR bead ID (empty if no MR)
+	Branch         string  // Polecat working branch
+	HookBead       string  // The work bead ID
+	MRFailed       bool    // True when MR creation was attempted but failed
+	PushFailed     bool    // True when branch push to origin failed (gas-556)
+	CompletionTime string  // RFC3339 timestamp
+	// Dual-SDK router telemetry fields (ADR §5.2, M5).
+	// TotalCostUSD is the cumulative session cost; EscalatedFrom is non-empty only
+	// when this completion followed a rail promotion from a prior DEFERRED session.
+	TotalCostUSD  float64 // cumulative cost (USD) across the polecat's life on this rail
+	EscalatedFrom string  // prior rail, e.g. "opencode", if this was a promoted DEFERRED
 }
 
 // UpdateAgentCompletion atomically writes all completion metadata fields
 // to an agent bead. Called by gt done to record completion state.
+// When TotalCostUSD or EscalatedFrom are populated in meta, they are
+// written as part of the dual-SDK router telemetry (ADR §5.2, M5).
 func (b *Beads) UpdateAgentCompletion(id string, meta *CompletionMetadata) error {
 	mrFailed := meta.MRFailed
 	pushFailed := meta.PushFailed
-	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
+	updates := AgentFieldUpdates{
 		ExitType:       &meta.ExitType,
 		MRID:           &meta.MRID,
 		Branch:         &meta.Branch,
 		MRFailed:       &mrFailed,
 		PushFailed:     &pushFailed,
 		CompletionTime: &meta.CompletionTime,
-	})
+	}
+	// Write dual-SDK telemetry fields when present (non-zero / non-empty).
+	if meta.TotalCostUSD != 0 {
+		cost := meta.TotalCostUSD
+		updates.TotalCostUSD = &cost
+	}
+	if meta.EscalatedFrom != "" {
+		updates.EscalatedFrom = &meta.EscalatedFrom
+	}
+	return b.UpdateAgentDescriptionFields(id, updates)
 }
 
 // ClearAgentCompletion removes all completion metadata fields from an agent bead.
 // Called when a polecat is re-slung with new work (resets stale completion state).
+// Rail telemetry fields (rail, rail_reason, total_cost_usd, escalated_from) are
+// NOT cleared here — they are written fresh at spawn time for the new assignment.
 func (b *Beads) ClearAgentCompletion(id string) error {
 	empty := ""
 	notFailed := false
+	zeroCost := float64(0)
 	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
 		ExitType:       &empty,
 		MRID:           &empty,
@@ -556,6 +630,9 @@ func (b *Beads) ClearAgentCompletion(id string) error {
 		MRFailed:       &notFailed,
 		PushFailed:     &notFailed,
 		CompletionTime: &empty,
+		// Clear telemetry so the new assignment starts with a clean slate.
+		TotalCostUSD:  &zeroCost,
+		EscalatedFrom: &empty,
 	})
 }
 
@@ -727,4 +804,55 @@ func (b *Beads) ListWispIDs() (map[string]bool, error) {
 		result[w.ID] = true
 	}
 	return result, nil
+}
+
+// UpdateAgentRailTelemetry writes the rail selection fields to an agent bead at spawn.
+// Called by the session manager immediately after the complexity classifier selects a rail.
+// This records rail + rail_reason so gt rail-stats can aggregate dispatch decisions.
+func (b *Beads) UpdateAgentRailTelemetry(id, rail, railReason string) error {
+	return b.UpdateAgentDescriptionFields(id, AgentFieldUpdates{
+		Rail:       &rail,
+		RailReason: &railReason,
+	})
+}
+
+// RailTelemetryEntry is a single dispatch record extracted from an agent bead,
+// used by gt rail-stats to aggregate without depending on a separate ledger file.
+type RailTelemetryEntry struct {
+	AgentID        string
+	Rail           string
+	RailReason     string
+	TotalCostUSD   float64
+	EscalatedFrom  string
+	CompletionTime string // RFC3339, empty when in-flight
+}
+
+// ListRailTelemetry returns rail telemetry entries for all agent beads that have
+// a non-empty rail field.  Beads with no rail field are silently skipped (they
+// pre-date M5 or belong to non-polecat roles).
+//
+// gt rail-stats calls this to aggregate dispatch decisions, costs, and escalation
+// rate across the ledger.
+func (b *Beads) ListRailTelemetry() ([]RailTelemetryEntry, error) {
+	agentBeads, err := b.ListAgentBeads()
+	if err != nil {
+		return nil, fmt.Errorf("listing agent beads for rail telemetry: %w", err)
+	}
+
+	var entries []RailTelemetryEntry
+	for id, issue := range agentBeads {
+		fields := ParseAgentFields(issue.Description)
+		if fields.Rail == "" {
+			continue
+		}
+		entries = append(entries, RailTelemetryEntry{
+			AgentID:        id,
+			Rail:           fields.Rail,
+			RailReason:     fields.RailReason,
+			TotalCostUSD:   fields.TotalCostUSD,
+			EscalatedFrom:  fields.EscalatedFrom,
+			CompletionTime: fields.CompletionTime,
+		})
+	}
+	return entries, nil
 }
