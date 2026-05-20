@@ -2135,6 +2135,154 @@ esac
 	}
 }
 
+// TestAllocateAndAdd_WritesTopLevelHookBead verifies that AllocateAndAdd
+// with a non-empty HookBead calls SetAgentHookBead so that the description
+// text is written and GetAgentBead surfaces issue.HookBead correctly.
+// This is the regression test for gastown-dogfood-cy3 (writer-side fix).
+func TestAllocateAndAdd_WritesTopLevelHookBead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mock for bd")
+	}
+
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+
+	// Mock bd that:
+	// - Logs all invocations (for assertion)
+	// - Returns a proper agent bead for create (single JSON object)
+	// - Returns a JSON array for show (for SetAgentHookBead / GetAgentBead)
+	// - Handles init/config/update/slot/reopen/migrate with exit 0
+	//
+	// show returns a description that already has hook_bead: pp-work-123
+	// so that GetAgentBead can surface it via the description fallback.
+	script := "#!/bin/sh\n" +
+		"LOG='" + logPath + "'\n" +
+		"printf '%s\\n' \"$*\" >> \"$LOG\"\n" +
+		"cmd=\"\"\n" +
+		"for arg in \"$@\"; do\n" +
+		"  case \"$arg\" in\n" +
+		"    --*) ;;\n" +
+		"    *) cmd=\"$arg\"; break ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		"case \"$cmd\" in\n" +
+		"  init|config|update|slot|reopen|migrate)\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"  create)\n" +
+		"    bead_id=\"mock-1\"\n" +
+		"    for arg in \"$@\"; do\n" +
+		"      case \"$arg\" in\n" +
+		"        --id=*) bead_id=\"${arg#--id=}\" ;;\n" +
+		"      esac\n" +
+		"    done\n" +
+		"    printf '{\"id\":\"%s\",\"status\":\"open\",\"created_at\":\"2025-01-01T00:00:00Z\"}\\n' \"$bead_id\"\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"  show)\n" +
+		"    bead_id=\"mock-1\"\n" +
+		"    for arg in \"$@\"; do\n" +
+		"      case \"$arg\" in\n" +
+		"        --*) ;;\n" +
+		"        show) ;;\n" +
+		"        *) bead_id=\"$arg\" ; break ;;\n" +
+		"      esac\n" +
+		"    done\n" +
+		"    printf '[{\"id\":\"%s\",\"issue_type\":\"task\",\"labels\":[\"gt:agent\"],\"description\":\"role_type: polecat\\\\nrig: rig\\\\nagent_state: spawning\\\\nhook_bead: pp-work-123\",\"hook_bead\":\"\"}]\\n' \"$bead_id\"\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"  *)\n" +
+		"    exit 0\n" +
+		"    ;;\n" +
+		"esac\n"
+
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write mock bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Set up rig with git repo (same as setupCanonicalBranchManagerTest but without installMockBd)
+	root := t.TempDir()
+	mayorRig := filepath.Join(root, "mayor", "rig")
+	if err := os.MkdirAll(mayorRig, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+	rigBeads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(rigBeads, 0755); err != nil {
+		t.Fatalf("mkdir rig .beads: %v", err)
+	}
+	mayorBeads := filepath.Join(mayorRig, ".beads")
+	if err := os.MkdirAll(mayorBeads, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig/.beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatalf("write rig redirect: %v", err)
+	}
+
+	cmdInit := exec.Command("git", "init", "-b", "main")
+	cmdInit.Dir = mayorRig
+	if out, err := cmdInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(mayorRig, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write README.md: %v", err)
+	}
+	mayorGit := git.NewGit(mayorRig)
+	if err := mayorGit.Add("README.md"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if err := mayorGit.Commit("Initial commit"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	cmdRemote := exec.Command("git", "remote", "add", "origin", mayorRig)
+	cmdRemote.Dir = mayorRig
+	if out, err := cmdRemote.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, out)
+	}
+	cmdUpdateRef := exec.Command("git", "update-ref", "refs/remotes/origin/main", "HEAD")
+	cmdUpdateRef.Dir = mayorRig
+	if out, err := cmdUpdateRef.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref: %v\n%s", err, out)
+	}
+
+	r := &rig.Rig{Name: "rig", Path: root}
+	mgr := NewManager(r, git.NewGit(root), nil)
+
+	polecatName, _, err := mgr.AllocateAndAdd(AddOptions{HookBead: "pp-work-123"})
+	if err != nil {
+		t.Fatalf("AllocateAndAdd: %v", err)
+	}
+
+	// Verify SetAgentHookBead was called by checking the bd log for hook_bead: pp-work-123
+	logBytes, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read mock bd log: %v", readErr)
+	}
+	logOutput := string(logBytes)
+	if !strings.Contains(logOutput, "hook_bead: pp-work-123") {
+		t.Fatalf("bd log does not contain hook_bead: pp-work-123 (SetAgentHookBead not called);\nlog:\n%s", logOutput)
+	}
+
+	// Verify GetAgentBead surfaces issue.HookBead from description fallback
+	agentID := mgr.agentBeadID(polecatName)
+	issue, fields, getErr := mgr.agentBeads().GetAgentBead(agentID)
+	if getErr != nil {
+		t.Fatalf("GetAgentBead: %v", getErr)
+	}
+	if fields == nil {
+		t.Fatal("GetAgentBead returned nil fields")
+	}
+	if fields.HookBead != "pp-work-123" {
+		t.Fatalf("fields.HookBead = %q, want %q", fields.HookBead, "pp-work-123")
+	}
+	if issue == nil {
+		t.Fatal("GetAgentBead returned nil issue")
+	}
+	if issue.HookBead != "pp-work-123" {
+		t.Fatalf("issue.HookBead = %q, want %q (description fallback should populate column)", issue.HookBead, "pp-work-123")
+	}
+}
+
 // TestAllocateAndAdd_NoDuplicateNames verifies that concurrent AllocateAndAdd
 // calls never produce duplicate polecat names (GH#2215). Each goroutine will
 // fail at worktree creation (no origin/main), but the allocated names must

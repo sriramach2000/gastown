@@ -820,9 +820,15 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	if agentBeadID != "" {
 		ab := beads.New(ctx.WorkDir).ForAgentBead()
 		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil {
-			// gastown-dogfood-cy3 band-aid: writer path (polecat.AllocateAndAdd) currently
-			// only writes hook_bead into the agent bead's description text, not the top-level
-			// column. Fall back to parsing the description when the column is empty.
+			// Fallback to description-text parsing kept as defense in depth after
+			// writer-side cy3 fix (gastown-dogfood-cy3, 58bb704a band-aid + writer
+			// fix in polecat/manager.go addWithOptionsLocked + beads.GetAgentBead).
+			// bd slot was removed in bd v0.62 so the structured hook_bead column is
+			// never written by the CLI path; the description text is the live source.
+			// GetAgentBead already centralises this fallback — but ab.Show() is called
+			// here directly (not GetAgentBead), so we repeat the fallback for safety.
+			// Can be removed in a future cleanup if this path is replaced with
+			// GetAgentBead() or if bd re-adds a hook_bead write flag.
 			if agentBead.HookBead == "" {
 				if parsed := beads.ParseAgentFields(agentBead.Description); parsed.HookBead != "" {
 					agentBead.HookBead = parsed.HookBead

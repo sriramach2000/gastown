@@ -436,6 +436,19 @@ func (b *Beads) UpdateAgentState(id string, state string) (retErr error) {
 // Hook slot on agent beads is no longer maintained. Work bead status=hooked
 // and assignee=<agent> is the authoritative source for hook tracking.
 
+// SetAgentHookBead writes the hook_bead field on an agent bead's description.
+// The bd CLI no longer supports writing the top-level hook_bead column directly
+// (bd slot was removed in bd v0.62, hq-l6mm5). The description-text field is the
+// only writable source; GetAgentBead surfaces it back through Issue.HookBead so
+// callers that read agentBead.HookBead see the correct value.
+//
+// This is the writer-side complement to the gastown-dogfood-cy3 band-aid in
+// prime.go: that fallback is kept for defense in depth, but this call ensures
+// the description text is explicitly set (and testable) at spawn time.
+func (b *Beads) SetAgentHookBead(agentBeadID, workBeadID string) error {
+	return b.UpdateAgentDescriptionFields(agentBeadID, AgentFieldUpdates{HookBead: &workBeadID})
+}
+
 // AgentFieldUpdates specifies which agent description fields to update.
 // Only non-nil fields are modified; nil fields are left unchanged.
 // This allows multiple fields to be updated in a single read-modify-write
@@ -654,6 +667,12 @@ func (b *Beads) GetAgentNotificationLevel(id string) (string, error) {
 
 // GetAgentBead retrieves an agent bead by ID.
 // Returns nil if not found.
+//
+// The returned Issue has HookBead populated from the description text when
+// the structured column is empty. bd v0.62 removed the bd slot command so the
+// top-level hook_bead column is never written by the CLI; the description text
+// (written by FormatAgentDescription / SetAgentHookBead) is the only live source.
+// This mirrors the ResolveAgentState pattern for agent_state.
 func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 	if target := b.agentBeadTarget(); target != b {
 		return target.GetAgentBead(id)
@@ -673,6 +692,17 @@ func (b *Beads) GetAgentBead(id string) (*Issue, *AgentFields, error) {
 
 	fields := ParseAgentFields(issue.Description)
 	fields.AgentState = ResolveAgentState(issue.Description, issue.AgentState)
+
+	// Populate the structured HookBead field from description text when the
+	// column is empty (gastown-dogfood-cy3 writer-side fix). The bd slot command
+	// was removed in v0.62 so the column is always null from the CLI write path;
+	// the description text written by FormatAgentDescription / SetAgentHookBead
+	// is the authoritative source. This centralises the fallback that was
+	// previously only in prime.go:findAgentWorkOnce.
+	if issue.HookBead == "" && fields.HookBead != "" {
+		issue.HookBead = fields.HookBead
+	}
+
 	return issue, fields, nil
 }
 

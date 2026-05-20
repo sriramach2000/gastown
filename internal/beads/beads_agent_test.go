@@ -207,6 +207,70 @@ func TestGetAgentBead_FallsBackToDescriptionAgentState(t *testing.T) {
 	}
 }
 
+func TestGetAgentBead_PopulatesHookBeadFromDescription(t *testing.T) {
+	// gastown-dogfood-cy3 writer-side fix: GetAgentBead must surface HookBead from
+	// description text when the structured column is empty (bd slot removed in v0.62).
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	// Column hook_bead is empty string (""); description text has hook_bead: pp-work-123
+	installMockBDFixedShowOutput(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"task","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: spawning\nhook_bead: pp-work-123","hook_bead":""}]`)
+
+	bd := NewIsolated(tmpDir)
+	issue, fields, err := bd.GetAgentBead("gt-gastown-polecat-nux")
+	if err != nil {
+		t.Fatalf("GetAgentBead: %v", err)
+	}
+	if issue == nil {
+		t.Fatal("GetAgentBead returned nil issue")
+	}
+	if fields == nil {
+		t.Fatal("GetAgentBead returned nil fields")
+	}
+	if fields.HookBead != "pp-work-123" {
+		t.Fatalf("fields.HookBead = %q, want %q", fields.HookBead, "pp-work-123")
+	}
+	// GetAgentBead must backfill issue.HookBead from description when column is empty.
+	if issue.HookBead != "pp-work-123" {
+		t.Fatalf("issue.HookBead = %q, want %q (description fallback should populate column)", issue.HookBead, "pp-work-123")
+	}
+}
+
+func TestSetAgentHookBead_OverwritesPriorValue(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses Unix shell script mocks for bd")
+	}
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	// Existing description has hook_bead: old-hook
+	logPath := installMockBDShowRecorder(t, `[{"id":"gt-gastown-polecat-nux","title":"Polecat nux","issue_type":"task","labels":["gt:agent"],"description":"role_type: polecat\nrig: gastown\nagent_state: spawning\nhook_bead: old-hook"}]`)
+	bd := NewIsolated(tmpDir)
+
+	if err := bd.SetAgentHookBead("gt-gastown-polecat-nux", "new-hook"); err != nil {
+		t.Fatalf("SetAgentHookBead: %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	if !strings.Contains(logOutput, "show gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing show call", logOutput)
+	}
+	if !strings.Contains(logOutput, "update gt-gastown-polecat-nux") {
+		t.Fatalf("mock bd log %q missing update call", logOutput)
+	}
+	if !strings.Contains(logOutput, "hook_bead: new-hook") {
+		t.Fatalf("mock bd log %q missing hook_bead: new-hook in update args", logOutput)
+	}
+	// Prior value must NOT appear in the update call
+	if strings.Contains(logOutput, "hook_bead: old-hook") {
+		t.Fatalf("mock bd log %q still contains old hook_bead value", logOutput)
+	}
+}
+
 func TestUpdateAgentState_UsesUpdateDescriptionPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mocks for bd")

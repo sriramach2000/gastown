@@ -856,6 +856,23 @@ func (m *Manager) addWithOptionsLocked(name string, opts AddOptions, polecatDir 
 		return nil, fmt.Errorf("agent bead required for polecat tracking: %w", err)
 	}
 
+	// Writer-side cy3 fix (gastown-dogfood-cy3): FormatAgentDescription already
+	// embeds hook_bead in the description text above. The explicit SetAgentHookBead
+	// call below is belt-and-suspenders documentation that the description-text
+	// hook_bead field IS the authoritative write path (bd slot was removed in
+	// bd v0.62; the structured column can no longer be written via the CLI).
+	// GetAgentBead reads this back through issue.HookBead via the description
+	// fallback. The band-aid in prime.go:findAgentWorkOnce is kept as a second
+	// layer of defense — see comment there.
+	if opts.HookBead != "" {
+		if setErr := m.agentBeads().SetAgentHookBead(agentID, opts.HookBead); setErr != nil {
+			// Non-fatal: the description was already written by createAgentBeadWithRetry.
+			// Log the warning but do not fail the spawn — the band-aid in prime.go
+			// provides a fallback read path. (gastown-dogfood-cy3)
+			style.PrintWarning("could not set agent hook_bead description field: %v", setErr)
+		}
+	}
+
 	now := time.Now()
 	polecat := &Polecat{
 		Name:      name,
