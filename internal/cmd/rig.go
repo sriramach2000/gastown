@@ -19,6 +19,7 @@ import (
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/deps"
 	"github.com/steveyegge/gastown/internal/doltserver"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -632,6 +633,16 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Printf("  Created agent bead: %s\n", refineryID)
 		}
+	}
+
+	// Provision embedded formulas to town .beads/formulas/ so gt sling works
+	// even when the gastown rig itself is not cloned locally (gastown-dogfood-wy8).
+	// ProvisionFormulas is idempotent: it skips files that already exist and
+	// creates the directory if absent. Non-fatal: rig is functional without it.
+	if count, err := formula.ProvisionFormulas(townRoot); err != nil {
+		fmt.Printf("  %s Could not provision formulas: %v\n", style.Warning.Render("!"), err)
+	} else if count > 0 {
+		fmt.Printf("  Provisioned %d formula(s) to .beads/formulas/\n", count)
 	}
 
 	// Auto-assign a namepool theme that doesn't collide with other rigs (gas-21k).

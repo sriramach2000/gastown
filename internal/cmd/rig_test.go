@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -200,5 +203,105 @@ func TestFindRigSessions_NoSessions(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("expected 0 sessions, got %d: %v", len(got), got)
+	}
+}
+
+// TestGtRigAdd_CreatesFreshFormulasWhenGastownAbsent verifies that when a
+// town has no gastown rig cloned locally, formula.ProvisionFormulas correctly
+// creates .beads/formulas/ with the embedded formula files so that gt sling
+// and bd formula list work without a gastown clone (gastown-dogfood-wy8).
+func TestGtRigAdd_CreatesFreshFormulasWhenGastownAbsent(t *testing.T) {
+	// Simulate a town root that has no .beads/formulas/ yet (no gastown rig).
+	townRoot := t.TempDir()
+
+	// Confirm .beads/formulas does NOT exist initially.
+	formulasDir := filepath.Join(townRoot, ".beads", "formulas")
+	if _, err := os.Stat(formulasDir); !os.IsNotExist(err) {
+		t.Fatalf("precondition: formulas dir should not exist yet, got err=%v", err)
+	}
+
+	// Call the same function that runRigAdd uses to provision formulas.
+	count, err := formula.ProvisionFormulas(townRoot)
+	if err != nil {
+		t.Fatalf("ProvisionFormulas() error: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("ProvisionFormulas() provisioned 0 formulas; expected ≥1 from embedded binary")
+	}
+
+	// .beads/formulas/ must now exist as a real directory (not a dangling symlink).
+	info, err := os.Stat(formulasDir)
+	if err != nil {
+		t.Fatalf(".beads/formulas does not exist after provisioning: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf(".beads/formulas is not a directory (got mode %v)", info.Mode())
+	}
+
+	// At least one .formula.toml file must be present and readable.
+	entries, err := os.ReadDir(formulasDir)
+	if err != nil {
+		t.Fatalf("reading .beads/formulas: %v", err)
+	}
+	var tomlCount int
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".formula.toml") {
+			tomlCount++
+			// Verify the file is readable and non-empty.
+			data, err := os.ReadFile(filepath.Join(formulasDir, e.Name()))
+			if err != nil {
+				t.Errorf("reading %s: %v", e.Name(), err)
+			}
+			if len(data) == 0 {
+				t.Errorf("%s is empty", e.Name())
+			}
+		}
+	}
+	if tomlCount == 0 {
+		t.Error(".beads/formulas contains no .formula.toml files after provisioning")
+	}
+
+	// Verify the embedded formula used by gt sling is present.
+	molPolelcatWork := filepath.Join(formulasDir, "mol-polecat-work.formula.toml")
+	if _, err := os.Stat(molPolelcatWork); os.IsNotExist(err) {
+		t.Error("mol-polecat-work.formula.toml not found; gt sling would fail without gastown rig")
+	}
+}
+
+// TestGtRigAdd_PreservesExistingFormulasSymlink verifies that when .beads/formulas/
+// is already present (e.g. from a prior gt install or gt rig add call),
+// formula.ProvisionFormulas does not overwrite user-customised formula files
+// (gastown-dogfood-wy8 — belt-and-braces regression).
+func TestGtRigAdd_PreservesExistingFormulasSymlink(t *testing.T) {
+	townRoot := t.TempDir()
+
+	// Pre-provision with the embedded formulas (simulates existing install or
+	// first gt rig add run).
+	if _, err := formula.ProvisionFormulas(townRoot); err != nil {
+		t.Fatalf("first ProvisionFormulas() error: %v", err)
+	}
+
+	// Simulate a user-customised formula by writing custom content.
+	formulasDir := filepath.Join(townRoot, ".beads", "formulas")
+	customPath := filepath.Join(formulasDir, "mol-polecat-work.formula.toml")
+	customContent := []byte("# user customisation — must NOT be overwritten\nversion = 9999\n")
+	if err := os.WriteFile(customPath, customContent, 0644); err != nil {
+		t.Fatalf("writing custom formula: %v", err)
+	}
+
+	// Run ProvisionFormulas a second time (simulates a second gt rig add in the
+	// same town, e.g. adding a second non-gastown rig).
+	_, err := formula.ProvisionFormulas(townRoot)
+	if err != nil {
+		t.Fatalf("second ProvisionFormulas() error: %v", err)
+	}
+
+	// The customised file must not be overwritten.
+	got, err := os.ReadFile(customPath)
+	if err != nil {
+		t.Fatalf("reading formula after second provisioning: %v", err)
+	}
+	if string(got) != string(customContent) {
+		t.Errorf("user-customised formula was overwritten; got %q, want %q", string(got), string(customContent))
 	}
 }

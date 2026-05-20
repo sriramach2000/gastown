@@ -402,6 +402,17 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Provision embedded formulas when --no-beads skipped the beads init block
+	// (gastown-dogfood-wy8). ProvisionFormulas creates .beads/formulas/ as a
+	// plain directory — no Dolt server required. Idempotent if already done above.
+	if installNoBeads {
+		if count, err := formula.ProvisionFormulas(absPath); err != nil {
+			fmt.Printf("   %s Could not provision formulas: %v\n", style.Dim.Render("⚠"), err)
+		} else if count > 0 {
+			fmt.Printf("   ✓ Provisioned %d formulas\n", count)
+		}
+	}
+
 	// Detect and save overseer identity
 	overseer, err := config.DetectOverseer(absPath)
 	if err != nil {
