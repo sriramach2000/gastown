@@ -55,6 +55,7 @@ Abbreviated patrol rules:
 - **dolt-health**: SKIP.
 - **zombie-scan**: SKIP.
 - **plugin-run**: SKIP.
+- **ingest-bugs**: SKIP.
 - **dog-pool-maintenance**: SKIP.
 - **dog-health-check**: SKIP.
 - **orphan-check**: SKIP.
@@ -788,6 +789,55 @@ Plugins marked parallel: true can run concurrently using Task tool subagents. Se
 Skip this step if $GT_ROOT/plugins/ does not exist or is empty."""
 
 [[steps]]
+id = "ingest-bugs"
+title = "Ingest pending BUG-*.md tickets into the scheduler queue"
+needs = ["plugin-run"]
+description = """
+Run mol-bug-ingestion for each active rig to convert pending BUG-*.md files
+into bd beads and sling them onto the rig for autonomous dispatch.
+
+This is the step that closes the manual-dispatch loop: new bug tickets written
+to `<rig>/refinery/rig/docs/bugs/pending/` are automatically ingested without
+operator intervention.
+
+**Step 1: List active rigs**
+```bash
+gt rigs --json | jq -r '.[].name'
+# Only process rigs that are NOT DOCKED or PARKED:
+for rig in $ALL_RIGS; do
+  gt rig status "$rig" | grep -qE 'DOCKED|PARKED' && echo "skip $rig" || echo "process $rig"
+done
+```
+
+**Step 2: For each active rig, run mol-bug-ingestion**
+
+Option A — inline via gt ingest-bugs (fast, no new session):
+```bash
+for rig in $ACTIVE_RIGS; do
+  gt ingest-bugs "$rig" || true   # non-fatal: log failure, continue
+done
+```
+
+Option B — dispatch as dog task (if load is high or rig count > 3):
+```bash
+gt sling mol-bug-ingestion deacon/dogs --var rig=<rig>
+```
+
+Use Option A (inline) by default. The ingestion command is fast: one
+`find`, one `bd list`, and N `bd create` + `gt sling` calls.
+
+**Step 3: Log summary**
+```
+Bug ingestion: processed N rigs | ingested X new beads | skipped Y existing | Z errors
+```
+
+If errors occur, gt ingest-bugs sends mail to deacon/ automatically.
+
+**Abbreviated patrol:** SKIP this step when `await-signal` outputs `EFFORT: reduced`.
+
+**Exit criteria:** mol-bug-ingestion run for all non-docked rigs (or errors logged)."""
+
+[[steps]]
 id = "dog-pool-maintenance"
 title = "Maintain dog pool"
 needs = ["health-scan"]
@@ -1241,7 +1291,7 @@ After await-signal returns (either by signal or timeout):
 gt patrol report --summary "<brief summary>" \
   --steps "heartbeat:OK,inbox-check:OK,orphan-process-cleanup:SKIP,..."
 ```
-The --steps flag is REQUIRED. List ALL 26 steps with their actual status.
+The --steps flag is REQUIRED. List ALL 27 steps with their actual status.
 Steps you executed get OK, steps you skipped get SKIP.
 This closes the current patrol wisp and automatically creates a new one.
 4. Continue executing from the first step of the new patrol cycle

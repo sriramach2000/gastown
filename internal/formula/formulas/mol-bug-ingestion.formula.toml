@@ -1,0 +1,308 @@
+description = """
+Autonomous bug-ticket ingestion: pending BUG-*.md → bd bead → gt sling.
+
+This formula closes the autonomous dispatch loop. Instead of an operator
+manually running `bd create` for each new bug ticket, this formula:
+
+1. **Discovers** pending BUG-*.md files in `<rig-root>/refinery/rig/docs/bugs/pending/`
+2. **Parses** YAML frontmatter (title, severity, labels, status, ...)
+3. **Deduplicates** — skips beads whose title already contains BUG-NNNN
+4. **Files** a new bead via `bd create` with mapped priority + labels
+5. **Auto-slings** the new bead onto the rig (`gt sling <bead-id> <rig>`)
+6. **Reports** ingested/skipped counts
+
+## Integration with Mayor's Patrol
+
+The Deacon's patrol (`mol-deacon-patrol`) calls this formula in the
+`ingest-bugs` step added to the patrol loop. After `plugin-run`, the patrol
+slings this formula to an idle dog (or runs it inline when no dog is needed).
+
+## Severity → Priority Mapping
+
+| Frontmatter severity | bd priority flag |
+|----------------------|-----------------|
+| CRITICAL             | 0               |
+| HIGH                 | 1               |
+| MED                  | 2               |
+| LOW                  | 3               |
+
+## Variables
+
+| Variable  | Source    | Description |
+|-----------|-----------|-------------|
+| rig       | sling var | The rig path to ingest bugs for (e.g., gastown, lockstep/refinery) |
+| rig_root  | sling var | Absolute path to rig root (default: inferred from $GT_ROOT/<rig>) |
+| dry_run   | sling var | If "true", print actions without creating beads |
+
+## Idempotency
+
+The formula is safe to run multiple times. Before creating a bead it checks
+existing bead titles for the BUG-NNNN token:
+```bash
+bd list --json | jq -r '.[].title // empty' | grep -qF "BUG-NNNN"
+```
+If found, that bug is skipped. Safe to call every patrol cycle.
+
+## Operator bootstrap
+
+Run once manually to start the loop:
+```bash
+gt sling mol-bug-ingestion <rig>/polecats --var rig=<rig>
+```
+After that, the Deacon handles it automatically every patrol cycle."""
+formula = "mol-bug-ingestion"
+version = 1
+
+[vars]
+[vars.rig]
+description = "Rig identifier to ingest bugs for (e.g., gastown, lockstep/refinery)"
+required = true
+
+[vars.rig_root]
+description = "Absolute path to the rig root directory. If empty, inferred as $GT_ROOT/<rig>."
+default = ""
+
+[vars.dry_run]
+description = "If 'true', print planned actions without creating beads or slinging"
+default = "false"
+
+[[steps]]
+id = "discover"
+title = "Discover pending bug markdown files"
+description = """
+Find all BUG-*.md files in the rig's pending bugs directory.
+
+**1. Resolve bugs directory:**
+```bash
+if [ -n "{{rig_root}}" ]; then
+  BUGS_DIR="{{rig_root}}/refinery/rig/docs/bugs/pending"
+else
+  BUGS_DIR="${GT_ROOT}/{{rig}}/refinery/rig/docs/bugs/pending"
+fi
+```
+
+**2. Find pending bug files:**
+```bash
+BUG_FILES=$(find "$BUGS_DIR" -name 'BUG-*.md' -type f 2>/dev/null | sort)
+```
+
+If the directory does not exist or is empty:
+- Log: `No pending bugs found in $BUGS_DIR`
+- Skip to report step (nothing to ingest)
+
+**3. Extract BUG-NNNN identifiers:**
+
+For each file found, extract the BUG ID from the filename:
+```bash
+# Example: BUG-0042-my-feature-crash.md → BUG-0042
+for file in $BUG_FILES; do
+  BUG_ID=$(basename "$file" .md | grep -oE 'BUG-[0-9]+')
+  echo "$BUG_ID $file"
+done
+```
+
+Record the full (BUG_ID, filepath) list for the deduplicate step.
+
+**Exit criteria:** Full list of pending BUG-*.md files with their BUG IDs recorded."""
+
+[[steps]]
+id = "deduplicate"
+title = "Check which bugs are already filed as beads"
+needs = ["discover"]
+description = """
+For each discovered BUG-NNNN, determine if a bead already exists.
+
+The idempotency check searches bead titles for the BUG-NNNN token so the
+formula is safe to re-run every patrol cycle without creating duplicates.
+
+**1. Fetch all bead titles in the rig:**
+```bash
+BEAD_TITLES=$(bd list --json --limit=0 2>/dev/null | jq -r '.[].title // empty')
+```
+
+Run this command from inside the rig directory (or with BEADS_DIR set)
+so bd routes to the correct database.
+
+**2. For each (BUG_ID, filepath) pair from discover:**
+```bash
+if echo "$BEAD_TITLES" | grep -qF "$BUG_ID"; then
+  EXISTING_BUGS="$EXISTING_BUGS $BUG_ID"
+else
+  NEW_BUGS="$NEW_BUGS $BUG_ID:$file"
+fi
+```
+
+**3. Log the partition:**
+```
+Partition: N_total total | N_new new | N_existing already filed
+```
+
+If all bugs already exist, skip directly to report.
+
+**Exit criteria:** NEW_BUGS and EXISTING_BUGS lists determined."""
+
+[[steps]]
+id = "ingest"
+title = "Parse frontmatter and file new beads"
+needs = ["deduplicate"]
+description = """
+For each bug in NEW_BUGS, parse its markdown file and create a bd bead.
+
+## Parsing YAML Frontmatter
+
+Each BUG-*.md file begins with a YAML frontmatter block delimited by `---`:
+
+```markdown
+---
+id: BUG-0042
+title: "My feature crashes on empty input"
+severity: HIGH
+status: pending
+labels:
+  - component:parser
+  - from-audit
+---
+
+Long-form description body follows ...
+```
+
+Extract fields:
+```bash
+FRONTMATTER=$(awk '/^---/{found++; next} found==1{print}' "$file")
+BODY=$(awk '/^---/{found++; next} found>=2{print}' "$file")
+
+TITLE=$(echo "$FRONTMATTER" | grep '^title:' | sed 's/^title: *//;s/^"//;s/"$//')
+SEVERITY=$(echo "$FRONTMATTER" | grep '^severity:' | awk '{print $2}')
+LABELS=$(echo "$FRONTMATTER" | awk '/^labels:/{in_l=1;next} in_l && /^  - /{print substr($0,5);next} in_l{in_l=0}')
+```
+
+## Severity → Priority Mapping
+
+```bash
+case "$SEVERITY" in
+  CRITICAL) PRIORITY=0 ;;
+  HIGH)     PRIORITY=1 ;;
+  MED)      PRIORITY=2 ;;
+  *)        PRIORITY=3 ;;
+esac
+```
+
+## Labels
+
+Combine frontmatter labels with the ingestion marker and bug ID tracker:
+```bash
+LABEL_ARGS="--label from-bug-ingestion --label bug-id:$BUG_ID"
+while IFS= read -r label; do
+  [ -n "$label" ] && LABEL_ARGS="$LABEL_ARGS --label $label"
+done <<< "$LABELS"
+```
+
+## Description
+
+Include the full file content (frontmatter + body) so the assigned polecat
+has complete context:
+```bash
+DESCRIPTION="$(cat "$file")"
+```
+
+## Create the bead
+
+The title embeds the BUG-NNNN token so future dedup checks find it.
+
+```bash
+if [ "{{dry_run}}" = "true" ]; then
+  echo "[DRY RUN] bd create --title \"$TITLE ($BUG_ID)\" --priority $PRIORITY $LABEL_ARGS"
+else
+  NEW_BEAD_ID=$(bd create \
+    --title "$TITLE ($BUG_ID)" \
+    --priority "$PRIORITY" \
+    $LABEL_ARGS \
+    --description "$DESCRIPTION" \
+    --json 2>/dev/null | jq -r '.id // empty')
+
+  if [ -z "$NEW_BEAD_ID" ]; then
+    echo "ERROR: bd create failed for $BUG_ID — skipping sling"
+    FAILED_BUGS="$FAILED_BUGS $BUG_ID"
+  else
+    echo "Created bead: $NEW_BEAD_ID for $BUG_ID"
+    CREATED_BEAD_IDS="$CREATED_BEAD_IDS $NEW_BEAD_ID"
+  fi
+fi
+```
+
+**Error handling:**
+- If `bd create` fails, log the error and continue with remaining bugs
+- Do NOT abort the entire ingestion run on a single failure
+- Record failed bugs for the report step
+
+**Exit criteria:** All NEW_BUGS processed (created or logged as failed)."""
+
+[[steps]]
+id = "auto-sling"
+title = "Sling each new bead onto the rig"
+needs = ["ingest"]
+description = """
+For each newly created bead, sling it onto the target rig so the scheduler
+picks it up for autonomous dispatch.
+
+```bash
+for bead_id in $CREATED_BEAD_IDS; do
+  if [ "{{dry_run}}" = "true" ]; then
+    echo "[DRY RUN] gt sling $bead_id {{rig}}"
+  else
+    if gt sling "$bead_id" "{{rig}}"; then
+      echo "Slung $bead_id → {{rig}}"
+      SLUNG_COUNT=$((SLUNG_COUNT + 1))
+    else
+      echo "WARNING: failed to sling $bead_id (bead created but not queued)"
+      SLING_FAILED_IDS="$SLING_FAILED_IDS $bead_id"
+    fi
+  fi
+done
+```
+
+**Why sling immediately?**
+
+`gt sling` enters the bead into the scheduler queue so the Mayor / Witness
+can dispatch it to a polecat without operator action. Without slinging, the
+bead exists in the database but is invisible to the dispatch machinery.
+
+**Exit criteria:** All created beads slung onto {{rig}} (or errors logged)."""
+
+[[steps]]
+id = "report"
+title = "Emit ingestion summary"
+needs = ["auto-sling"]
+description = """
+Emit a concise count summary so the Deacon's patrol digest captures it.
+
+**Print to stdout:**
+```
+Bug ingestion complete for rig: {{rig}}
+  Discovered: N  files in <bugs-dir>
+  Ingested:   N  new beads (slung to {{rig}})
+  Skipped:    N  already filed
+  Errors:     N  create/sling failures
+```
+
+If ingested > 0, log the bead IDs for observability:
+```
+New beads: <bead-id-1> <bead-id-2> ...
+```
+
+**If any errors, send mail to deacon for review:**
+```bash
+if [ "$N_err" -gt 0 ]; then
+  gt mail send deacon/ \
+    -s "BUG_INGESTION_ERRORS: $N_err failures for {{rig}}" \
+    -m "Bug ingestion encountered errors for rig: {{rig}}
+
+Failed create: $FAILED_BUGS
+Failed sling:  $SLING_FAILED_IDS
+
+Re-run manually:
+  gt sling mol-bug-ingestion {{rig}} --var rig={{rig}}"
+fi
+```
+
+**Exit criteria:** Summary printed; error mail sent if needed."""
