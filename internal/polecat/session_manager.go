@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/steveyegge/gastown/internal/agent"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -44,13 +45,21 @@ var (
 type SessionManager struct {
 	tmux *tmux.Tmux
 	rig  *rig.Rig
+
+	// agentSessions holds the agent.Session interface for each running polecat.
+	// Keyed by polecat name. Populated by Start(); used by the M3 router to
+	// dispatch rail-aware lifecycle calls (ADR 2026-05-19, §4.3).
+	// For M1 this stores a claudeSession wrapping the same tmux session that
+	// the existing tmux-based code manages — behavior is unchanged until M3.
+	agentSessions map[string]agent.Session
 }
 
 // NewSessionManager creates a new polecat session manager for a rig.
 func NewSessionManager(t *tmux.Tmux, r *rig.Rig) *SessionManager {
 	return &SessionManager{
-		tmux: t,
-		rig:  r,
+		tmux:          t,
+		rig:           r,
+		agentSessions: make(map[string]agent.Session),
 	}
 }
 
@@ -625,6 +634,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// Record the agent instantiation event (GASTA root span).
 	session.RecordAgentInstantiateFromDir(context.Background(), runID, runtimeConfig.ResolvedAgent,
 		"polecat", polecat, sessionID, m.rig.Name, townRoot, opts.Issue, workDir)
+
+	// M1 dual-SDK wiring: create an agent.Session for this polecat and store it
+	// so the M3 router can dispatch lifecycle calls through the interface.
+	// For M1 the Session wraps the same tmux session already managed above —
+	// behavior is byte-identical. The router replaces this call in M3.
+	if agentSess, err := agent.New(agent.RailClaude, agent.StartOptions{
+		PolecatName: polecat,
+		Rig:         m.rig.Name,
+		WorkDir:     workDir,
+		BeadID:      opts.Issue,
+	}); err == nil {
+		m.agentSessions[polecat] = agentSess
+	}
 
 	return nil
 }
