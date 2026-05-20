@@ -85,6 +85,12 @@ type SessionStartOptions struct {
 	// If set, GT_AGENT is written to the tmux session environment table so that
 	// IsAgentAlive and waitForPolecatReady read the correct process names.
 	Agent string
+
+	// Beads is an optional bd handle. When set with a non-empty Issue, the
+	// SessionManager writes M5 rail telemetry (Rail, RailReason, EscalatedFrom)
+	// to the agent bead's description after spawn succeeds. When nil, the
+	// telemetry write is skipped (no error). gastown-dogfood-sfb follow-up.
+	Beads *beads.Beads
 }
 
 // SessionInfo contains information about a running polecat session.
@@ -664,10 +670,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		})
 	}
 	// gastown-dogfood-sfb: emit final-rail line so log readers (and the dashboard)
-	// see the ACTUAL rail used, not the classifier's pre-fallback decision. The
-	// M5 bd-ledger write (UpdateAgentRailTelemetry + EscalatedFrom) needs the
-	// SessionManager to hold a *beads.Beads handle — tracked separately because
-	// it touches all NewSessionManager call sites.
+	// see the ACTUAL rail used, not the classifier's pre-fallback decision.
 	if sessErr == nil {
 		if escalatedFrom != "" {
 			fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s final-rail=%s escalated-from=%s rule=%d\n",
@@ -677,6 +680,24 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 				routeBead.ID, rail, ruleNum)
 		}
 		m.agentSessions[polecat] = agentSess
+
+		// M5 telemetry write (gastown-dogfood-sfb): when caller provided a bd
+		// handle + an Issue, write Rail/RailReason/EscalatedFrom to the agent
+		// bead's description. Best-effort; failures are logged not returned.
+		if opts.Beads != nil && opts.Issue != "" {
+			actualRail := string(rail)
+			reason := fmt.Sprintf("rule=%d", ruleNum)
+			updates := beads.AgentFieldUpdates{
+				Rail:       &actualRail,
+				RailReason: &reason,
+			}
+			if escalatedFrom != "" {
+				updates.EscalatedFrom = &escalatedFrom
+			}
+			if telErr := opts.Beads.UpdateAgentDescriptionFields(opts.Issue, updates); telErr != nil {
+				fmt.Fprintf(os.Stderr, "[polecat-spawn] M5 telemetry write failed: %v\n", telErr)
+			}
+		}
 	}
 
 	return nil
