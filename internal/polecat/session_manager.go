@@ -642,16 +642,20 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	// to RailClaude so the polecat still gets a session (ADR §6 F3 mitigation).
 	routeBead := m.beadForRoute(opts.Issue, workDir)
 	rail, ruleNum := agent.RouteFor(routeBead)
-	fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s rail=%s rule=%d\n", routeBead.ID, rail, ruleNum)
+	classifierRail := rail
+	fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s classifier-rail=%s rule=%d\n", routeBead.ID, classifierRail, ruleNum)
 	agentSess, sessErr := agent.New(rail, agent.StartOptions{
 		PolecatName: polecat,
 		Rig:         m.rig.Name,
 		WorkDir:     workDir,
 		BeadID:      opts.Issue,
 	})
+	escalatedFrom := ""
 	if sessErr != nil && rail == agent.RailOpenCode {
 		// OpenCode rail unavailable — fall back to Claude so the polecat still spawns.
 		fmt.Fprintf(os.Stderr, "[polecat-spawn] RailOpenCode unavailable (%v); falling back to RailClaude\n", sessErr)
+		escalatedFrom = string(rail)
+		rail = agent.RailClaude
 		agentSess, sessErr = agent.New(agent.RailClaude, agent.StartOptions{
 			PolecatName: polecat,
 			Rig:         m.rig.Name,
@@ -659,7 +663,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 			BeadID:      opts.Issue,
 		})
 	}
+	// gastown-dogfood-sfb: emit final-rail line so log readers (and the dashboard)
+	// see the ACTUAL rail used, not the classifier's pre-fallback decision. The
+	// M5 bd-ledger write (UpdateAgentRailTelemetry + EscalatedFrom) needs the
+	// SessionManager to hold a *beads.Beads handle — tracked separately because
+	// it touches all NewSessionManager call sites.
 	if sessErr == nil {
+		if escalatedFrom != "" {
+			fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s final-rail=%s escalated-from=%s rule=%d\n",
+				routeBead.ID, rail, escalatedFrom, ruleNum)
+		} else {
+			fmt.Fprintf(os.Stderr, "[polecat-spawn] bead=%s final-rail=%s rule=%d\n",
+				routeBead.ID, rail, ruleNum)
+		}
 		m.agentSessions[polecat] = agentSess
 	}
 
