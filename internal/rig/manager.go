@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -123,9 +124,10 @@ const CurrentRigConfigVersion = 1
 
 // Manager handles rig discovery, loading, and creation.
 type Manager struct {
-	townRoot string
-	config   *config.RigsConfig
-	git      *git.Git
+	townRoot     string
+	config       *config.RigsConfig
+	git          *git.Git
+	warnedAbsent sync.Map // keys: rig name strings; value: struct{}{}; one-shot warning dedupe (gastown-dogfood-hju)
 }
 
 // NewManager creates a new rig manager.
@@ -139,13 +141,23 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig, g *git.Git) *Man
 
 // DiscoverRigs returns all rigs registered in the workspace.
 // Rigs that fail to load are logged to stderr and skipped; partial results are returned.
+//
+// When a rig's local directory is absent (e.g. registered in rigs.json but not yet cloned),
+// the warning is emitted only once per Manager lifetime to avoid spam on every gt command
+// (gastown-dogfood-hju).
 func (m *Manager) DiscoverRigs() ([]*Rig, error) {
 	var rigs []*Rig
 
 	for name, entry := range m.config.Rigs {
 		rig, err := m.loadRig(name, entry)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to load rig %q: %v\n", name, err)
+			// Emit the warning at most once per absent-rig name per Manager instance.
+			// DiscoverRigs is called on every gt command; without the dedupe the warning
+			// fires on every invocation, even when the operator is fully aware that the
+			// local clone is missing (e.g. gastown entry in rigs.json before first clone).
+			if _, alreadyWarned := m.warnedAbsent.LoadOrStore(name, struct{}{}); !alreadyWarned {
+				fmt.Fprintf(os.Stderr, "Warning: failed to load rig %q: %v\n", name, err)
+			}
 			continue
 		}
 		rigs = append(rigs, rig)

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/wisp"
 )
@@ -132,7 +135,18 @@ func applyRigBeadTTLOverrides(ttls map[string]time.Duration, townRoot, rigName s
 	beadsDir := beads.ResolveBeadsDir(townRoot)
 	bd := beads.NewWithBeadsDir(townRoot, beadsDir)
 
-	rigBeadID := beads.RigBeadIDWithPrefix("gt", rigName)
+	// Resolve the rig's actual beads prefix (gastown-dogfood-k45).
+	// Hardcoding "gt" here caused a spurious "no route found for prefix gt-" warning
+	// for any rig whose --prefix flag was not "gt" (e.g. --prefix pp yields pp-rig-planner,
+	// but we were looking up gt-rig-planner which had no registered route).
+	prefix := "gt" // safe fallback for legacy / unconfigured rigs
+	rigPath := filepath.Join(townRoot, rigName)
+	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.Beads != nil && rigCfg.Beads.Prefix != "" {
+		prefix = rigCfg.Beads.Prefix
+	} else if p := config.GetRigPrefix(townRoot, rigName); p != "" {
+		prefix = p
+	}
+	rigBeadID := beads.RigBeadIDWithPrefix(prefix, rigName)
 	issue, err := bd.Show(rigBeadID)
 	if err != nil {
 		return
