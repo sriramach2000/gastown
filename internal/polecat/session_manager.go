@@ -511,6 +511,15 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && opts.RuntimeConfigDir != "" {
 		envVars[runtimeConfig.Session.ConfigDirEnv] = opts.RuntimeConfigDir
 	}
+	// Settings-inheritance isolation (gastown-dogfood-q5e). Polecats inherit the
+	// operator's ~/.claude config including PreToolUse and UserPromptSubmit gates
+	// designed for interactive sessions (ticket-first, gateguard fact-forcing).
+	// Those gates have no satisfier inside an autonomous bot and stall the
+	// polecat. GASTOWN_POLECAT_MODE is the umbrella signal; the two specific
+	// bypasses use the env knobs the hook authors already shipped.
+	envVars["GASTOWN_POLECAT_MODE"] = "1"
+	envVars["GATEGUARD_DISABLED"] = "1"
+	envVars["CLAUDE_TICKET_FIRST_OFF"] = "1"
 
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
