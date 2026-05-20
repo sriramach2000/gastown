@@ -1397,61 +1397,102 @@ notifyWitness:
 	// Update agent bead state (ZFC: self-report completion)
 	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
 
-	// Persistent polecat model (gt-hdf8): polecats transition to IDLE after completion.
-	// Session stays alive, sandbox preserved, worktree synced to main for reuse.
-	// "done means idle" - not "done means dead".
+	// Per-job-worktree: check whether polecat reuse is enabled.
+	// When disabled (default), destroy the worktree on exit instead of syncing to idle.
+	polecatReuseAllowed := false
+	{
+		settingsPath := config.TownSettingsPath(townRoot)
+		if ts, tsErr := config.LoadOrCreateTownSettings(settingsPath); tsErr == nil && ts != nil && ts.Scheduler != nil {
+			polecatReuseAllowed = ts.Scheduler.IsPolecatReuseAllowed()
+		}
+	}
+
+	// Polecat exit model:
+	//
+	// allow_polecat_reuse=true (legacy Phase 3): transition to IDLE — session stays
+	//   alive, sandbox preserved, worktree synced to main for reuse.
+	//   "done means idle" - not "done means dead".
+	//
+	// allow_polecat_reuse=false (default — per-job-worktree): destroy the worktree
+	//   after every exit. No cross-bead state leakage. ~5s extra overhead per sling.
 	isPolecat := false
 	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil && roleInfo.Role == RolePolecat {
 		isPolecat = true
 
-		fmt.Printf("%s Sandbox preserved for reuse (persistent polecat)\n", style.Bold.Render("✓"))
-
-		if pushFailed || mrFailed {
-			fmt.Printf("%s Work needs recovery (push or MR failed) — session preserved\n", style.Bold.Render("⚠"))
-		}
-
-		// Sync worktree to main so the polecat is ready for new assignments.
-		// Phase 3 of persistent-polecat-pool: DONE→IDLE syncs to main and deletes old branch.
-		// Non-fatal: if sync fails, the polecat is still IDLE and the Witness
-		// or next gt sling can handle the branch state.
-		//
-		// GUARD (gt-pvx): Refuse to sync if uncommitted changes remain.
-		// If the auto-commit safety net above failed (git add/commit error),
-		// switching branches would discard the work. Better to leave the worktree
-		// dirty on the feature branch so work can be recovered.
-		syncSafe := true
-		if cwdAvailable {
-			if ws, wsErr := g.CheckUncommittedWork(); wsErr == nil && ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
-				syncSafe = false
-				style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
-				fmt.Printf("  Files: %s\n", ws.String())
-			}
-		}
-		if cwdAvailable && !pushFailed && syncSafe {
-			// Remember the old branch so we can delete it after switching
-			oldBranch := branch
-
-			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			if err := g.Checkout(defaultBranch); err != nil {
-				style.PrintWarning("could not checkout %s: %v (worktree stays on feature branch)", defaultBranch, err)
-			} else if err := g.Pull("origin", defaultBranch); err != nil {
-				style.PrintWarning("could not pull %s: %v (worktree on %s but may be stale)", defaultBranch, defaultBranch, err)
-			} else {
-				fmt.Printf("%s Worktree synced to %s\n", style.Bold.Render("✓"), defaultBranch)
-			}
-
-			// Delete the old polecat branch (non-fatal: cleanup only).
-			// This prevents stale branch accumulation from persistent polecats.
-			if oldBranch != "" && oldBranch != defaultBranch && oldBranch != "master" {
-				if err := g.DeleteBranch(oldBranch, true); err != nil {
-					style.PrintWarning("could not delete old branch %s: %v", oldBranch, err)
+		if !polecatReuseAllowed {
+			// Per-job-worktree model: nuke worktree on done/DEFERRED.
+			// Use selfNuke=true so the cwd-in-worktree safety check is bypassed
+			// (polecat is inside its own worktree by design).
+			// nuclear=true to bypass git-status checks — all code changes are
+			// already committed and pushed (or the agent explicitly chose DEFERRED).
+			// Non-fatal: if removal fails, log warning and continue to session kill.
+			fmt.Printf("%s Per-job-worktree: removing worktree after exit\n", style.Bold.Render("→"))
+			if polecatName != "" {
+				rigPath := filepath.Join(townRoot, rigName)
+				r := &rig.Rig{Name: rigName, Path: rigPath}
+				polecatGit := git.NewGit(rigPath)
+				t := tmux.NewTmux()
+				polecatMgr := polecat.NewManager(r, polecatGit, t)
+				const nuclear = true
+				const selfNuke = true
+				if removeErr := polecatMgr.RemoveWithOptions(polecatName, true, nuclear, selfNuke); removeErr != nil {
+					style.PrintWarning("could not remove worktree for %s: %v (session will still be killed)", polecatName, removeErr)
 				} else {
-					fmt.Printf("%s Deleted old branch %s\n", style.Bold.Render("✓"), oldBranch)
+					fmt.Printf("%s Worktree removed (per-job-worktree model)\n", style.Bold.Render("✓"))
 				}
 			}
-		}
+		} else {
+			// Legacy Phase 3 persistent-polecat-pool: sync worktree to main so
+			// the polecat is ready for new assignments on next sling.
+			fmt.Printf("%s Sandbox preserved for reuse (persistent polecat)\n", style.Bold.Render("✓"))
 
-		fmt.Printf("%s Polecat transitioned to IDLE — ready for new work\n", style.Bold.Render("✓"))
+			if pushFailed || mrFailed {
+				fmt.Printf("%s Work needs recovery (push or MR failed) — session preserved\n", style.Bold.Render("⚠"))
+			}
+
+			// Sync worktree to main so the polecat is ready for new assignments.
+			// Phase 3 of persistent-polecat-pool: DONE→IDLE syncs to main and deletes old branch.
+			// Non-fatal: if sync fails, the polecat is still IDLE and the Witness
+			// or next gt sling can handle the branch state.
+			//
+			// GUARD (gt-pvx): Refuse to sync if uncommitted changes remain.
+			// If the auto-commit safety net above failed (git add/commit error),
+			// switching branches would discard the work. Better to leave the worktree
+			// dirty on the feature branch so work can be recovered.
+			syncSafe := true
+			if cwdAvailable {
+				if ws, wsErr := g.CheckUncommittedWork(); wsErr == nil && ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
+					syncSafe = false
+					style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
+					fmt.Printf("  Files: %s\n", ws.String())
+				}
+			}
+			if cwdAvailable && !pushFailed && syncSafe {
+				// Remember the old branch so we can delete it after switching
+				oldBranch := branch
+
+				fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
+				if err := g.Checkout(defaultBranch); err != nil {
+					style.PrintWarning("could not checkout %s: %v (worktree stays on feature branch)", defaultBranch, err)
+				} else if err := g.Pull("origin", defaultBranch); err != nil {
+					style.PrintWarning("could not pull %s: %v (worktree on %s but may be stale)", defaultBranch, defaultBranch, err)
+				} else {
+					fmt.Printf("%s Worktree synced to %s\n", style.Bold.Render("✓"), defaultBranch)
+				}
+
+				// Delete the old polecat branch (non-fatal: cleanup only).
+				// This prevents stale branch accumulation from persistent polecats.
+				if oldBranch != "" && oldBranch != defaultBranch && oldBranch != "master" {
+					if err := g.DeleteBranch(oldBranch, true); err != nil {
+						style.PrintWarning("could not delete old branch %s: %v", oldBranch, err)
+					} else {
+						fmt.Printf("%s Deleted old branch %s\n", style.Bold.Render("✓"), oldBranch)
+					}
+				}
+			}
+
+			fmt.Printf("%s Polecat transitioned to IDLE — ready for new work\n", style.Bold.Render("✓"))
+		}
 	}
 
 	fmt.Println()
