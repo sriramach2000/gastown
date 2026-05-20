@@ -1076,5 +1076,71 @@
     </div>
 
     <script src="/static/dashboard.js?v=3"></script>
+    <script>
+    // Polecat lifecycle SSE events — /events endpoint (WitnessSSEPublisher).
+    // These are distinct from the htmx-ext-sse connection on sse-connect="/events"
+    // which drives full-page dashboard-update swaps. The raw EventSource below
+    // handles individual polecat lifecycle events for lightweight status overlays
+    // (toast notifications, live status badges) without triggering a full re-render.
+    //
+    // Event types received: polecat-spawned, polecat-hooked, polecat-working,
+    //                       polecat-done, bead-state-change.
+    // Payload shape (all fields): ts, polecat_id, rig, hook_bead, rail, state.
+    (function() {
+        var pcEvtSource = null;
+        var pcReconnectDelay = 2000;
+        var pcMaxReconnectDelay = 60000;
+
+        function connectPolecatSSE() {
+            if (pcEvtSource) {
+                pcEvtSource.close();
+            }
+            // The /events endpoint is served by WitnessSSEPublisher (not the
+            // htmx-ext-sse extension). We use a separate EventSource here so
+            // we can handle typed events without interfering with the htmx swap.
+            pcEvtSource = new EventSource('/events');
+
+            function handlePolecatEvent(e) {
+                var data;
+                try { data = JSON.parse(e.data); } catch (_) { return; }
+                var type = e.type; // e.g. "polecat-spawned"
+                if (window.onPolecatEvent) {
+                    window.onPolecatEvent(type, data);
+                }
+                // Dispatch a CustomEvent so other scripts can listen without
+                // needing direct access to the EventSource instance.
+                document.dispatchEvent(new CustomEvent('polecat-event', {
+                    detail: { type: type, payload: data }
+                }));
+            }
+
+            var polecatEvents = [
+                'polecat-spawned',
+                'polecat-hooked',
+                'polecat-working',
+                'polecat-deferred',
+                'polecat-done',
+                'bead-state-change'
+            ];
+            polecatEvents.forEach(function(evType) {
+                pcEvtSource.addEventListener(evType, handlePolecatEvent);
+            });
+
+            pcEvtSource.onerror = function() {
+                pcEvtSource.close();
+                setTimeout(function() {
+                    pcReconnectDelay = Math.min(pcReconnectDelay * 2, pcMaxReconnectDelay);
+                    connectPolecatSSE();
+                }, pcReconnectDelay);
+            };
+
+            pcEvtSource.addEventListener('open', function() {
+                pcReconnectDelay = 2000;
+            });
+        }
+
+        connectPolecatSSE();
+    })();
+    </script>
 </body>
 </html>
