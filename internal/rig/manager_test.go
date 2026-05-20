@@ -3,6 +3,7 @@ package rig
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2122,5 +2123,106 @@ esac
 	}
 	if strings.Contains(cmds, "--discard-remote") {
 		t.Errorf("bd init should NOT have --discard-remote without sync.remote; got:\n%s", cmds)
+	}
+}
+
+// TestLoadRig_AbsentDirectory_OneShotWarning verifies that DiscoverRigs emits a
+// "failed to load rig" warning at most once per absent rig name per Manager instance,
+// even when called multiple times (gastown-dogfood-hju regression).
+func TestLoadRig_AbsentDirectory_OneShotWarning(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+
+	// Register a rig that has NO local directory (simulates gastown entry in rigs.json
+	// before the first clone, or after the directory was manually removed).
+	rigsConfig.Rigs["ghostrig"] = config.RigEntry{
+		GitURL: "git@github.com:test/ghostrig.git",
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// Capture stderr so we can count warning emissions.
+	oldStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	os.Stderr = w
+
+	// Call DiscoverRigs 5 times — warning must fire exactly once.
+	const calls = 5
+	for i := 0; i < calls; i++ {
+		rigs, _ := manager.DiscoverRigs()
+		// The absent rig must be skipped, not panic.
+		for _, r := range rigs {
+			if r.Name == "ghostrig" {
+				t.Errorf("call %d: absent rig %q must not be returned", i, "ghostrig")
+			}
+		}
+	}
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	capturedBytes, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("reading captured stderr: %v", readErr)
+	}
+	captured := string(capturedBytes)
+
+	warnPrefix := `Warning: failed to load rig "ghostrig"`
+	count := strings.Count(captured, warnPrefix)
+	if count == 0 {
+		t.Errorf("expected exactly 1 warning for absent rig, got 0")
+	}
+	if count > 1 {
+		t.Errorf("expected exactly 1 warning for absent rig across %d calls, got %d:\n%s", calls, count, captured)
+	}
+}
+
+// TestLoadRig_PresentDirectory_NoWarning verifies that DiscoverRigs emits no warning
+// when the rig directory exists as expected (sanity check).
+func TestLoadRig_PresentDirectory_NoWarning(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+
+	createTestRig(t, root, "presentrig")
+	rigsConfig.Rigs["presentrig"] = config.RigEntry{
+		GitURL: "git@github.com:test/presentrig.git",
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// Capture stderr.
+	oldStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	os.Stderr = w
+
+	rigs, discoverErr := manager.DiscoverRigs()
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	capturedBytes, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("reading captured stderr: %v", readErr)
+	}
+	captured := string(capturedBytes)
+
+	if discoverErr != nil {
+		t.Fatalf("DiscoverRigs: %v", discoverErr)
+	}
+	found := false
+	for _, rig := range rigs {
+		if rig.Name == "presentrig" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected presentrig in DiscoverRigs result")
+	}
+	if captured != "" {
+		t.Errorf("expected no warnings for present rig, got:\n%s", captured)
 	}
 }

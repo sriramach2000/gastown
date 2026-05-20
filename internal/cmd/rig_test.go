@@ -1,11 +1,16 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	rigpkg "github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -200,5 +205,89 @@ func TestFindRigSessions_NoSessions(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("expected 0 sessions, got %d: %v", len(got), got)
+	}
+}
+
+// TestRigAdd_UsesPrefixInIdentityBead is the gastown-dogfood-k45 regression test.
+//
+// applyRigBeadTTLOverrides (compact.go) previously hardcoded "gt" when constructing
+// the rig identity bead ID, causing a spurious "no route found for prefix gt-" warning
+// on every gt command for rigs whose --prefix was not "gt" (e.g. --prefix pp creates
+// pp-rig-planner, but the old code looked up gt-rig-planner which had no route).
+//
+// The fix reads the prefix from rig/config.json (or rigs.json fallback).
+// This test verifies:
+//  1. rig.LoadRigConfig correctly persists the --prefix value in config.json.
+//  2. applyRigBeadTTLOverrides with a rig configured as "pp" does NOT emit the
+//     "no route found for prefix gt-" warning that the bug caused.
+func TestRigAdd_UsesPrefixInIdentityBead(t *testing.T) {
+	// Build a minimal townRoot with a rig config.json that has prefix "pp".
+	townRoot := t.TempDir()
+	rigName := "planner"
+	rigPath := filepath.Join(townRoot, rigName)
+	if err := os.MkdirAll(rigPath, 0755); err != nil {
+		t.Fatalf("mkdir rig: %v", err)
+	}
+
+	// Write a rig config.json with prefix "pp" — mirrors what gt rig add --prefix pp creates.
+	cfg := rigpkg.RigConfig{
+		Type:    "rig",
+		Version: 1,
+		Name:    rigName,
+		GitURL:  "git@github.com:test/planner.git",
+		Beads:   &rigpkg.BeadsConfig{Prefix: "pp"},
+	}
+	cfgBytes, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal rig config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, "config.json"), cfgBytes, 0644); err != nil {
+		t.Fatalf("write rig config: %v", err)
+	}
+
+	// Verify LoadRigConfig round-trips the "pp" prefix.
+	loaded, err := rigpkg.LoadRigConfig(rigPath)
+	if err != nil {
+		t.Fatalf("LoadRigConfig: %v", err)
+	}
+	if loaded.Beads == nil || loaded.Beads.Prefix != "pp" {
+		var gotPrefix string
+		if loaded.Beads != nil {
+			gotPrefix = loaded.Beads.Prefix
+		}
+		t.Fatalf("LoadRigConfig returned prefix %q, want %q", gotPrefix, "pp")
+	}
+
+	// Capture stderr to verify applyRigBeadTTLOverrides does NOT produce the
+	// "no route found for prefix gt-" warning that the k45 bug caused.
+	oldStderr := os.Stderr
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	os.Stderr = w
+
+	ttls := make(map[string]time.Duration)
+	// applyRigBeadTTLOverrides calls bd.Show(pp-rig-planner). bd is not available in
+	// unit tests, so Show returns an error and the function returns early without
+	// modifying ttls. The important assertion: no "gt-" routing warning is emitted.
+	applyRigBeadTTLOverrides(ttls, townRoot, rigName)
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("reading captured stderr: %v", err)
+	}
+	captured := buf.String()
+
+	// Pre-fix: Warning: no route found for prefix "gt-" (bead gt-rig-planner)
+	// Post-fix: looks up pp-rig-planner instead; absent beads DB is silent.
+	if strings.Contains(captured, `prefix "gt-"`) {
+		t.Errorf("k45 regression: applyRigBeadTTLOverrides emitted gt- routing warning for prefix-pp rig:\n%s", captured)
+	}
+	if strings.Contains(captured, "gt-rig-planner") {
+		t.Errorf("k45 regression: applyRigBeadTTLOverrides looked up gt-rig-planner; should look up pp-rig-planner:\n%s", captured)
 	}
 }
