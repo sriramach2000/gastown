@@ -195,6 +195,10 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 			if err := verifyWorktreeExists(polecatObj.ClonePath); err != nil {
 				return nil, fmt.Errorf("worktree verification failed for reused %s: %w", polecatName, err)
 			}
+			// Ensure .venv exists in the reused polecat worktree (non-fatal on reuse path).
+			if err := ensurePolecatVenv(polecatObj.ClonePath); err != nil {
+				style.PrintWarning("venv ensure failed for reused polecat %s: %v (continuing)", polecatName, err)
+			}
 
 			polecatSessMgr := polecat.NewSessionManager(t, r)
 			sessionName := polecatSessMgr.SessionName(polecatName)
@@ -301,6 +305,11 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		_ = polecatMgr.Remove(polecatName, true) // force=true to clean up partial state
 		return nil, fmt.Errorf("worktree verification failed for %s: %w\nHint: try 'gt polecat nuke %s/%s --force' to clean up",
 			polecatName, err, rigName, polecatName)
+	}
+	// Ensure .venv exists in the new polecat worktree (fatal on new-spawn path).
+	if err := ensurePolecatVenv(polecatObj.ClonePath); err != nil {
+		_ = polecatMgr.Remove(polecatName, true)
+		return nil, fmt.Errorf("venv init failed for new polecat %s: %w", polecatName, err)
 	}
 
 	// Get session manager for session name (session start is deferred)
@@ -470,6 +479,48 @@ func IsRigName(target string) (string, bool) {
 	}
 
 	return target, true
+}
+
+// ensurePolecatVenv ensures a Python virtual environment exists at <clonePath>/.venv.
+// If the .venv directory is absent it is created with python3 -m venv.
+// CLI_HUB_NO_TELEMETRY=1 is written into the venv activation profile so that any
+// cli-hub CLI installed inside the venv runs with telemetry suppressed (§D11).
+// Returns an error only when venv creation itself fails; the caller decides severity.
+func ensurePolecatVenv(clonePath string) error {
+	venvPath := filepath.Join(clonePath, ".venv")
+	venvPython := filepath.Join(venvPath, "bin", "python")
+
+	// Fast path: .venv/bin/python already present — nothing to do.
+	if _, err := os.Stat(venvPython); err == nil {
+		return nil
+	}
+
+	// Create the venv.
+	cmd := exec.Command("python3", "-m", "venv", venvPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("python3 -m venv %s: %w\n%s", venvPath, err, strings.TrimSpace(string(out)))
+	}
+
+	// Verify effect (Block 14 — trust effect, not exit code).
+	if _, err := os.Stat(venvPython); err != nil {
+		return fmt.Errorf("venv created but %s is missing (partial creation?): %w", venvPython, err)
+	}
+
+	// Write CLI_HUB_NO_TELEMETRY=1 into the venv activation profile (§D11).
+	activatePath := filepath.Join(venvPath, "bin", "activate")
+	activateContent, err := os.ReadFile(activatePath)
+	if err == nil {
+		telemetryLine := "\nexport CLI_HUB_NO_TELEMETRY=1\n"
+		if !strings.Contains(string(activateContent), "CLI_HUB_NO_TELEMETRY") {
+			f, openErr := os.OpenFile(activatePath, os.O_APPEND|os.O_WRONLY, 0644)
+			if openErr == nil {
+				_, _ = f.WriteString(telemetryLine)
+				_ = f.Close()
+			}
+		}
+	}
+
+	return nil
 }
 
 // verifyWorktreeExists checks that a git worktree was actually created at the given path
