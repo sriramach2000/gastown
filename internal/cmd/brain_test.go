@@ -176,7 +176,8 @@ func TestStartBrainDreamTickerCancelImmediately(t *testing.T) {
 // error when gbrain is not present in node_modules or PATH.
 // (Uses a temp dir with no node_modules and a PATH that doesn't contain gbrain.)
 func TestFindGbrainBinaryFallsBackToPath(t *testing.T) {
-	t.Parallel()
+	// Cannot t.Parallel() here: this test uses t.Setenv to override PATH,
+	// and Go forbids combining the two.
 
 	townRoot := t.TempDir()
 
