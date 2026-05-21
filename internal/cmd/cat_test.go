@@ -18,6 +18,12 @@ func TestIsBeadID(t *testing.T) {
 		{"wy-def", true},
 		// Multi-segment prefixes
 		{"hq-cv-foo", true},
+		// Rig-local prefixes with digits (registered in <town>/.beads/routes.jsonl).
+		// Regression for 2026-05-21 'gt hook attach xl4-t1c' rejection.
+		{"xl4-t1c", true},
+		{"j7-abc", true},
+		{"gp-1-foo", true},
+		{"wyv-9", true},
 		// Invalid inputs
 		{"", false},
 		{"-abc", false},
@@ -26,6 +32,7 @@ func TestIsBeadID(t *testing.T) {
 		{"123-abc", false},
 		{"gt-", false},
 		{"-", false},
+		{"4xl-t1c", false}, // prefix must START with a letter
 	}
 
 	for _, tt := range tests {

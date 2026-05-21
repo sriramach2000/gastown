@@ -61,17 +61,28 @@ func runCat(cmd *cobra.Command, args []string) error {
 }
 
 // isBeadID checks if a string looks like a bead ID.
-// Bead IDs have the format <prefix>-<id> where prefix is lowercase letters
-// (e.g. gt-abc123, bd-xyz, hq-cv-foo, wisp-bar, mol-baz).
+// Bead IDs have the format <prefix>-<id> where prefix starts with a lowercase
+// letter and may contain lowercase letters and digits afterwards
+// (e.g. gt-abc123, bd-xyz, hq-cv-foo, wisp-bar, mol-baz, xl4-t1c, gp-1-foo).
+//
+// Rig-local prefixes registered in <town>/.beads/routes.jsonl frequently
+// include digits (e.g. "xl4-", "j7-"). Rejecting those broke
+// 'gt hook attach <rig-bead-id>' even though 'bd show' resolves them fine
+// via the rig routing table. See operator report 2026-05-21.
 func isBeadID(s string) bool {
-	// Must contain a dash and start with lowercase letters
+	// Must contain a dash and start with a lowercase letter, with at least one
+	// character after the dash.
 	dashIdx := strings.Index(s, "-")
 	if dashIdx <= 0 || dashIdx >= len(s)-1 {
 		return false
 	}
-	// Prefix must be all lowercase letters
-	for _, c := range s[:dashIdx] {
-		if c < 'a' || c > 'z' {
+	// First char of prefix must be a lowercase letter (so "123-abc" still fails).
+	if s[0] < 'a' || s[0] > 'z' {
+		return false
+	}
+	// Remaining prefix chars may be lowercase letters or digits.
+	for _, c := range s[1:dashIdx] {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
 			return false
 		}
 	}
