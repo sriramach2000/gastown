@@ -72,7 +72,7 @@ var primeCmd = &cobra.Command{
 Role detection:
   - Town root → Neutral (no role inferred; use GT_ROLE)
   - mayor/ or <rig>/mayor/ → Mayor context
-  - <rig>/witness/rig/ → Witness context
+  - <rig>/witness/ → Witness context
   - <rig>/refinery/rig/ → Refinery context
   - <rig>/polecats/<name>/ → Polecat context
 
@@ -252,8 +252,15 @@ func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
 }
 
 func roleRequiresWorktreeIntegrity(role Role) bool {
+	// Witness is intentionally excluded: per internal/rig/manager.go:817
+	// ("Create witness directory (no clone needed)") and
+	// internal/config/roles/witness.toml (work_dir = "{town}/{rig}/witness",
+	// needs_pre_sync = false), the witness role workspace is a plain
+	// directory with no git worktree. Requiring .git metadata for it
+	// blocks every gt prime --hook with a misleading "missing .git
+	// metadata" error. See BUG-0004 in the xl4 bug catalog.
 	switch role {
-	case RolePolecat, RoleCrew, RoleWitness, RoleRefinery, RoleDog, RoleBoot:
+	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot:
 		return true
 	default:
 		return false
