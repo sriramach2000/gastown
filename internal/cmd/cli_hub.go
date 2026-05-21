@@ -373,10 +373,11 @@ func init() {
 	cliHubCmd.AddCommand(cliHubCatalogRefreshCmd)
 	cliHubCmd.AddCommand(cliHubPolicyCmd)
 
-	// NOTE: rootCmd.AddCommand(cliHubCmd) is intentionally NOT called here.
-	// The orchestrator adds it in the wiring wave (Step W-1, root.go)
-	// to avoid merge conflicts with other subcommands registered in init().
-	// See Gate-2 plan §7 Step W-1.
+	// Wiring wave (orchestrator): register cliHubCmd on rootCmd.
+	// Added here in cli_hub.go's init() because gastown's root.go does not
+	// aggregate AddCommand calls — every subcommand self-registers via its
+	// own init() (matches trail.go, crew.go, etc.). See Gate-2 plan §7 W-1.
+	rootCmd.AddCommand(cliHubCmd)
 }
 
 // CLIHubAuditEvent and AppendCLIHubEvent live in trail.go (HUB-COOKIE Wave 1).

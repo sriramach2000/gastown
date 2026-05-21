@@ -123,8 +123,11 @@ func init() {
 	brainCmd.AddCommand(brainSearchCmd)
 	brainCmd.AddCommand(brainQueryCmd)
 
-	// NOTE: brainCmd is NOT added to rootCmd here.
-	// Orchestrator wires `rootCmd.AddCommand(brainCmd)` in root.go after merge.
+	// Wiring wave (orchestrator): register brainCmd on rootCmd.
+	// Added here in brain.go's init() rather than root.go's init() because
+	// gastown's root.go does not aggregate AddCommand calls — every subcommand
+	// self-registers via its own init() (see trail.go, crew.go, etc.).
+	rootCmd.AddCommand(brainCmd)
 }
 
 // runBrainInit implements `gt brain init`.

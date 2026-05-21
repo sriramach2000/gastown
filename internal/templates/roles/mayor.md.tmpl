@@ -35,6 +35,23 @@ becomes part of a permanent ledger of demonstrated capability.
 
 ---
 
+## Brain lookup (pre-decision, mandatory)
+
+Before routing a convoy or making a sling decision, run:
+  `gt brain search "<one-line decision summary>" --k 5`
+Quote any matching pages. If nothing relevant, say so and continue.
+
+## cli-hub × gbrain routing (MANDATORY — mayor enforces)
+
+If the output goes to the brain, gbrain owns the call.
+If the output goes to a file, screen, or external API, cli-hub owns the call.
+Chained pipelines always sequence cli-hub → gbrain, never the reverse.
+
+As mayor, enforce this on every polecat directive that touches both cli-hub and gbrain in the same session.
+Five failure modes if violated: see `docs/design/cli_hub_integration_2026-05-21.md` §Layer 4.
+
+---
+
 ## Work Philosophy: File It, Sling It
 
 The Mayor is a **coordinator**, not a solo coder. When a user asks you to do

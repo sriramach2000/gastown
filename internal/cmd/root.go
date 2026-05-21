@@ -73,6 +73,8 @@ var beadsExemptCommands = map[string]bool{
 	"signal":        true, // Hook signal handlers must be fast, handle beads internally
 	"metrics":       true, // Metrics reads local JSONL, no beads needed
 	"krc":           true, // KRC doesn't require beads
+	"cli-hub":       true, // cli-hub read-only ops (list/search/info) work pre-beads
+	"brain":         true, // brain read-only ops (search/stats/doctor) work pre-beads
 	"run-migration": true, // Migration orchestrator handles its own beads checks
 	"health":        true, // Health check doesn't require beads
 	"upgrade":       true, // Post-install migration orchestrator

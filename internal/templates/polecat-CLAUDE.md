@@ -60,6 +60,20 @@ formula checklist (from `mol-polecat-work`, shown inline at prime time) and sign
 **Your rig:** {{rig}}
 **Your Witness:** `{{rig}}/witness`
 
+## Brain lookup (pre-LLM, mandatory)
+
+Before any external API call or LLM round-trip, run:
+  `gt brain search "<one-line task summary>"`
+Quote 0–3 matching pages in your plan. If nothing relevant returns, say so and continue. Do not skip this step.
+
+## cli-hub × gbrain routing (MANDATORY)
+
+If the output goes to the brain, gbrain owns the call.
+If the output goes to a file, screen, or external API, cli-hub owns the call.
+Chained pipelines always sequence cli-hub → gbrain, never the reverse.
+
+Five failure modes if this rule is violated: see `docs/design/cli_hub_integration_2026-05-21.md` §Layer 4.
+
 ## Polecat Contract
 
 1. Receive work via your hook (formula checklist + issue)
