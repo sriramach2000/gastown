@@ -379,48 +379,6 @@ func init() {
 	// See Gate-2 plan §7 Step W-1.
 }
 
-// CLIHubAuditEvent is the shared type for cookie-trail events.
-// This is the canonical definition per HUB-COOKIE's contract
-// (internal/cmd/trail.go will declare the identical struct).
-// Defined here so cli_hub.go can construct it without importing trail.go
-// during the parallel-agent period. At integration, the orchestrator
-// removes this redeclaration and uses the type from trail.go.
-//
-// NOTE: When HUB-COOKIE lands and trail.go declares this type,
-// the orchestrator's wiring wave must remove this block to avoid
-// duplicate type declaration. The field contract is guaranteed identical
-// (see Gate-2 §HUB-PKG Field Contract).
-type CLIHubAuditEvent struct {
-	Ts             time.Time `json:"ts"`
-	Kind           string    `json:"kind"`              // "cli_hub_install" | "cli_hub_invoke"
-	Name           string    `json:"name"`
-	Verdict        string    `json:"verdict,omitempty"`
-	Polecat        string    `json:"polecat"`
-	BeadID         string    `json:"bead_id,omitempty"`
-	ExitCode       int       `json:"exit_code,omitempty"`
-	DurationMs     int64     `json:"duration_ms,omitempty"`
-	EscalationLink string    `json:"escalation_link,omitempty"`
-}
-
-// AppendCLIHubEvent is the stub for HUB-COOKIE's trail.go function.
-// When HUB-COOKIE lands, this stub is removed and the real implementation
-// from trail.go is used (same signature, same effect).
-// The stub writes to the cookie-trail JSONL so Wave 1 is functional
-// even before HUB-COOKIE merges.
-func AppendCLIHubEvent(event CLIHubAuditEvent) error {
-	home := os.Getenv("HOME")
-	trailPath := filepath.Join(home, ".cookie-trail.jsonl")
-
-	f, err := os.OpenFile(trailPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("cli_hub: opening cookie trail %s: %w", trailPath, err)
-	}
-	defer f.Close()
-
-	line, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("cli_hub: marshalling cookie trail event: %w", err)
-	}
-	_, err = fmt.Fprintf(f, "%s\n", line)
-	return err
-}
+// CLIHubAuditEvent and AppendCLIHubEvent live in trail.go (HUB-COOKIE Wave 1).
+// The stub block previously here was removed by the orchestrator at integration time
+// per Gate-2 §HUB-PKG instructions ("orchestrator removes the stub at integration").
