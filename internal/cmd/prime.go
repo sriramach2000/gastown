@@ -251,20 +251,27 @@ func ensureRoleWorktreeIntegrity(cwd, townRoot string, role Role) error {
 	return nil
 }
 
+// roleRequiresWorktreeIntegrity decides whether the prime-hook integrity
+// gate must run against the role's work_dir. Driven by the role.toml file
+// (Session.RequiresWorktreeIntegrity) so the predicate cannot fall out of
+// sync with role topology — see BUG-0004 in the xl4 bug catalog for what
+// the prior hand-maintained switch case got wrong.
+//
+// Boot is special-cased true because it is a pre-role bootstrap identity
+// that has no role.toml; its workspace is always a real worktree by the
+// time the gate runs.
 func roleRequiresWorktreeIntegrity(role Role) bool {
-	// Witness is intentionally excluded: per internal/rig/manager.go:817
-	// ("Create witness directory (no clone needed)") and
-	// internal/config/roles/witness.toml (work_dir = "{town}/{rig}/witness",
-	// needs_pre_sync = false), the witness role workspace is a plain
-	// directory with no git worktree. Requiring .git metadata for it
-	// blocks every gt prime --hook with a misleading "missing .git
-	// metadata" error. See BUG-0004 in the xl4 bug catalog.
-	switch role {
-	case RolePolecat, RoleCrew, RoleRefinery, RoleDog, RoleBoot:
+	if role == RoleBoot {
 		return true
-	default:
+	}
+	def, err := config.LoadBuiltinRoleDefinition(string(role))
+	if err != nil {
+		// Unknown role string → default-deny, matching the prior switch
+		// default. The previous behavior for Role("not-a-real-role") was
+		// false; preserve it.
 		return false
 	}
+	return def.Session.RequiresWorktreeIntegrity
 }
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.

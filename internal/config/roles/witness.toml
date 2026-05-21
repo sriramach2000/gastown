@@ -10,6 +10,10 @@ prompt_template = "witness.md.tmpl"
 pattern = "{prefix}-witness"
 work_dir = "{town}/{rig}/witness"
 needs_pre_sync = false
+# BUG-0004: witness role has NO clone, NO worktree, NO .git metadata.
+# Setting requires_worktree_integrity = true here would break every
+# `gt prime --hook` for a witness session.
+requires_worktree_integrity = false
 start_command = "exec claude --dangerously-skip-permissions"
 
 [env]

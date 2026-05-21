@@ -55,6 +55,23 @@ type RoleSessionConfig struct {
 	// NeedsPreSync indicates if workspace needs git sync before starting.
 	NeedsPreSync bool `toml:"needs_pre_sync"`
 
+	// RequiresWorktreeIntegrity indicates whether the role's work_dir is
+	// expected to be a real git worktree (with .git metadata). When true,
+	// `gt prime --hook` runs worktreeintegrity.Validate before priming
+	// the role; when false, the gate is skipped.
+	//
+	// This is distinct from NeedsPreSync: a role can have a worktree
+	// without needing a git pull before start (e.g., polecat, dog), and
+	// in principle a role could need a pre-sync against a non-worktree
+	// (though no current role does). The two flags answer different
+	// questions and are kept independent.
+	//
+	// BUG-0004 origin: this field replaces a hand-maintained switch case
+	// in internal/cmd/prime.go that fell out of sync with role topology
+	// when the witness role's directory contract changed. Single source
+	// of truth: the role.toml file.
+	RequiresWorktreeIntegrity bool `toml:"requires_worktree_integrity"`
+
 	// StartCommand is the command to run after creating the session.
 	// Default: "exec claude --dangerously-skip-permissions"
 	StartCommand string `toml:"start_command,omitempty"`
@@ -175,6 +192,14 @@ func LoadRoleDefinition(townRoot, rigPath, roleName string) (*RoleDefinition, er
 	return def, nil
 }
 
+// LoadBuiltinRoleDefinition is the cross-package public wrapper around
+// loadBuiltinRoleDefinition. It exists so callers outside the config
+// package (e.g., internal/cmd) can drive role-topology predicates from
+// the canonical role.toml file rather than re-implementing them.
+func LoadBuiltinRoleDefinition(roleName string) (*RoleDefinition, error) {
+	return loadBuiltinRoleDefinition(roleName)
+}
+
 // loadBuiltinRoleDefinition loads a role definition from embedded defaults.
 func loadBuiltinRoleDefinition(roleName string) (*RoleDefinition, error) {
 	data, err := defaultRolesFS.ReadFile("roles/" + roleName + ".toml")
@@ -231,6 +256,13 @@ func mergeRoleDefinition(base, override *RoleDefinition) {
 	// disabling it would break the role's assumptions about workspace state.
 	if override.Session.NeedsPreSync {
 		base.Session.NeedsPreSync = true
+	}
+	// RequiresWorktreeIntegrity can only be enabled via override, not disabled.
+	// Same rationale as NeedsPreSync: a role's builtin describes whether the
+	// work_dir is a real git worktree, and overriding to false would mask a
+	// misconfigured workspace.
+	if override.Session.RequiresWorktreeIntegrity {
+		base.Session.RequiresWorktreeIntegrity = true
 	}
 	if override.Session.StartCommand != "" {
 		base.Session.StartCommand = override.Session.StartCommand
