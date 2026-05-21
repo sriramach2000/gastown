@@ -384,6 +384,8 @@ func runDaemonRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating daemon: %w", err)
 	}
 
+	go startBrainDreamTicker(cmd.Context(), townRoot)
+
 	return d.Run()
 }
 
