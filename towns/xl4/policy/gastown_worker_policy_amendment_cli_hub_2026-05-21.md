@@ -217,6 +217,7 @@ Note: **none of these are pre-approved.** They illustrate the shape of an escala
 |------|--------|--------|
 | 2026-05-21 | postmortem author | Initial draft; v0.1 |
 | 2026-05-21 | operator | APPROVED — "essential for full autonomy" |
+| 2026-05-21 | operator | v0.1.1 — allowlist policy set to `trust_registry` mode: any name returned by `cli-hub list` is auto-approved (registry vetting is the gate). Operator rationale: "everything that has been approved as not dubious by the hub. it is verified and usually has comments and download statistics". |
 
 ---
 

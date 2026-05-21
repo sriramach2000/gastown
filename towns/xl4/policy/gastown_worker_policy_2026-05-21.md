@@ -244,6 +244,8 @@ The orchestrator runs `~/gt/.policy/check.sh` and blocks the wave if exit is non
 | 2026-05-21 | postmortem author | Initial draft; v0; awaits operator confirm |
 | 2026-05-21 | operator | v0.1 APPROVED — cli-hub-meta-skill integration per [`gastown_worker_policy_amendment_cli_hub_2026-05-21.md`](./gastown_worker_policy_amendment_cli_hub_2026-05-21.md) ("essential for full autonomy"). Mechanical rollout in flight (setup.sh / check.sh / allowlist deployed by bootstrap; base policy §5 Tier 3 + §8 + §9 + §10 references the amendment). |
 | 2026-05-21 | postmortem author | v0.2 PROPOSED — bug-hospital integration per [`gastown_worker_policy_amendment_hospital_2026-05-21.md`](./gastown_worker_policy_amendment_hospital_2026-05-21.md). Adds `bug-feedback-loop` as Tier 1 mandatory (prior-art gate + lifecycle gate); `docs/bugs/{pending,resolved,wontfix}/BUG-NNNN-<slug>.md` schema; severity × shape escalation fork. Awaits operator confirm. |
+| 2026-05-21 | operator | v0.2 APPROVED — hospital amendment ratified ("hospital yes"). 3 hq-* escalations backfilled as BUG-0001/0002/0003 in xl4 repo. `bug-feedback-loop` skill promoted to Tier 1 mandatory contract. |
+| 2026-05-21 | operator | v0.1.1 — cli-hub allowlist set to `trust_registry` mode per operator decision ("everything that has been approved as not dubious by the hub. it is verified and usually has comments and download statistics"). Any name returned by `cli-hub list` is auto-approved for `cli-hub install` without paired escalation. |
 
 ---
 

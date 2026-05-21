@@ -204,7 +204,26 @@ deploy_policy() {
     log "  creating $policy_dir/cli_hub_allowlist.yaml (empty v0)"
     cat >"$policy_dir/cli_hub_allowlist.yaml" <<'YAML'
 # Town-level cli-hub allowlist — operator-managed.
-# Per gastown_worker_policy_amendment_cli_hub_2026-05-21.md §A3.
+# Per gastown_worker_policy_amendment_cli_hub_2026-05-21.md §A3 + §A13 v0.1.1
+# (operator 2026-05-21: trust_registry mode).
+#
+# policy.mode: trust_registry
+#   The cli-hub registry itself vets entries (verified status + comments +
+#   download statistics). Any name returned by `cli-hub list` is auto-approved
+#   for `cli-hub install` — no per-tool escalation required.
+#   check.sh §A7 honors this mode and skips the name-allowlist verification.
+#   Cookie-trail still records every install (audit retained).
+#
+# To revert to per-tool explicit allowlist:
+#   1. Remove policy.mode line
+#   2. Populate `allowlisted` with explicit entries (see format below).
+policy:
+  mode: trust_registry
+  registry_url: https://reeceyang.sgp1.cdn.digitaloceanspaces.com/SKILL.md
+  rationale: |
+    operator 2026-05-21 — "everything that has been approved as not dubious by
+    the hub. it is verified and usually has comments and download statistics"
+# Per-tool explicit entries (only consulted when policy.mode != trust_registry):
 # Format:
 #   - name: <cli-anything-name>             # e.g. cli-anything-gimp
 #     approved_by: <operator>
@@ -212,6 +231,8 @@ deploy_policy() {
 #     rationale: <one-line: what bead class needs it>
 #     max_invocations_per_polecat_run: <int>  # optional cap
 allowlisted: []
+# Explicit denylist — overrides allowlist even under trust_registry mode.
+denylist: []
 YAML
   fi
   if [[ ! -f "$policy_dir/check.sh" ]]; then
@@ -243,7 +264,21 @@ except ImportError:
     print("POLICY WARN: PyYAML missing; skipping cli-hub allowlist check"); sys.exit(0)
 trail_lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
 allow_doc = yaml.safe_load(pathlib.Path(sys.argv[2]).read_text() or "") or {}
-allowed = {x["name"] for x in (allow_doc.get("allowlisted") or [])}
+mode = (allow_doc.get("policy") or {}).get("mode", "")
+denied = {x["name"] for x in (allow_doc.get("denylist") or []) if isinstance(x, dict)}
+allowed = {x["name"] for x in (allow_doc.get("allowlisted") or []) if isinstance(x, dict)}
+# trust_registry mode: any name OK unless on denylist (operator decision 2026-05-21)
+if mode == "trust_registry":
+    for i, line in enumerate(trail_lines):
+        try: rec = json.loads(line)
+        except json.JSONDecodeError: continue
+        if rec.get("action") != "cli_hub_install": continue
+        ev = rec.get("evidence", "")
+        m = re.search(r"name=(\S+)", ev)
+        name = m.group(1) if m else ""
+        if name in denied:
+            print(f"POLICY HIGH: cli_hub_install of {name!r} is on the denylist"); sys.exit(1)
+    sys.exit(0)
 for i, line in enumerate(trail_lines):
     try: rec = json.loads(line)
     except json.JSONDecodeError: continue

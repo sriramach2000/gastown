@@ -1,6 +1,6 @@
 # Gastown worker policy — Amendment: bug-hospital integration (2026-05-21)
 
-**Status:** PROPOSED — operator ratifies before next-session boot.
+**Status:** APPROVED 2026-05-21 — "hospital yes".
 **Amends:** `gastown_worker_policy_2026-05-21.md` v0 §5 Tier 1+2 + §8 Escalation + §9 Forbidden + §10 check.sh.
 **Versioning:** Bumps base policy to **v0.2** once rolled out (post-v0.1 cli-hub amendment).
 **Companion:** `gastown_worker_policy_amendment_cli_hub_2026-05-21.md` (Tier 3 discovery primitive).
@@ -189,6 +189,7 @@ Net: this amendment is **cheaper to enforce than to skip**.
 | Date | Author | Change |
 |------|--------|--------|
 | 2026-05-21 | postmortem author | Initial draft; v0.2; awaits operator confirm |
+| 2026-05-21 | operator | APPROVED — "hospital yes"; promoted to Tier 1 mandatory in base policy v0.2. Status: APPROVED. |
 
 ---
 
