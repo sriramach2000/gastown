@@ -478,6 +478,76 @@ func findBeadsDir() (string, error) {
 	return findMailWorkDir()
 }
 
+// cookieTrailPath returns the path to the cookie-trail JSONL file.
+// Defined as a var to allow override in tests.
+var cookieTrailPath = func() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving home directory: %w", err)
+	}
+	return filepath.Join(home, ".cookie-trail.jsonl"), nil
+}
+
+// CLIHubAuditEvent is the audit record written to ~/.cookie-trail.jsonl for
+// every cli-hub install and invoke action. Closes governance gap 1: makes the
+// cookie-trail write mandatory (Go-enforced) rather than an honour-system manual append.
+type CLIHubAuditEvent struct {
+	Ts             time.Time `json:"ts"`
+	Kind           string    `json:"kind"`             // "cli_hub_install" | "cli_hub_invoke"
+	Name           string    `json:"name"`
+	Verdict        string    `json:"verdict,omitempty"` // "APPROVED" | "DENIED <reason>"
+	Polecat        string    `json:"polecat"`
+	BeadID         string    `json:"bead_id,omitempty"`
+	ExitCode       int       `json:"exit_code,omitempty"`
+	DurationMs     int64     `json:"duration_ms,omitempty"`
+	EscalationLink string    `json:"escalation_link,omitempty"`
+}
+
+// AppendCLIHubEvent appends a cli-hub audit event to the cookie-trail at
+// ~/.cookie-trail.jsonl. Each record is a single line of JSON (NDJSON).
+//
+// Closes governance gap 1: mechanical write replaces honour-system manual append.
+// O_APPEND writes are atomic on POSIX for writes < PIPE_BUF (~4 KB); a JSON
+// audit record is ~300 bytes, so concurrent appends are safe without a lock.
+func AppendCLIHubEvent(event CLIHubAuditEvent) error {
+	trailPath, err := cookieTrailPath()
+	if err != nil {
+		return err
+	}
+
+	// Ensure the parent directory exists (it is ~ itself, always present, but
+	// guard defensively for test overrides that use a temp directory).
+	if dir := filepath.Dir(trailPath); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("creating cookie-trail directory: %w", err)
+		}
+	}
+
+	// Set Ts to now if caller left it zero.
+	if event.Ts.IsZero() {
+		event.Ts = time.Now()
+	}
+
+	entryJSON, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshaling cli-hub audit event: %w", err)
+	}
+
+	// Open for append (create if absent).
+	// O_APPEND writes are atomic on POSIX for small payloads; no explicit lock needed.
+	f, err := os.OpenFile(trailPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("opening cookie-trail: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write(append(entryJSON, '\n')); err != nil {
+		return fmt.Errorf("writing cli-hub audit event: %w", err)
+	}
+
+	return nil
+}
+
 func relativeTime(t time.Time) string {
 	if t.IsZero() {
 		return ""
