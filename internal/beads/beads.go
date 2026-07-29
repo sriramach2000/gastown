@@ -89,7 +89,8 @@ func BdSupportsAllowStaleWithEnv(env []string) bool {
 	// Check output for "unknown flag" to detect lack of support. Treat probe
 	// errors/timeouts as unsupported so higher-level commands fail closed
 	// instead of hanging on a wedged bd subprocess.
-	supported := err == nil && !strings.Contains(combinedOut.String(), "unknown flag")
+	probeOut := strings.TrimSpace(combinedOut.String())
+	supported := err == nil && probeOut != "" && !strings.Contains(probeOut, "unknown flag")
 
 	bdAllowStaleMu.Lock()
 	if bdAllowStalePath != bdPath {
@@ -176,6 +177,8 @@ type Issue struct {
 	ID          string   `json:"id"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
+	Design      string   `json:"design,omitempty"`
+	Notes       string   `json:"notes,omitempty"`
 	Status      string   `json:"status"`
 	Priority    int      `json:"priority"`
 	Type        string   `json:"issue_type"`
@@ -184,6 +187,7 @@ type Issue struct {
 	UpdatedAt   string   `json:"updated_at"`
 	ClosedAt    string   `json:"closed_at,omitempty"`
 	Parent      string   `json:"parent,omitempty"`
+	ExternalRef string   `json:"external_ref,omitempty"`
 	Assignee    string   `json:"assignee,omitempty"`
 	Children    []string `json:"children,omitempty"`
 	DependsOn   []string `json:"depends_on,omitempty"`
@@ -213,6 +217,16 @@ type Issue struct {
 	// delegation state (delegated_from key) and merge-slot state (holder/waiters).
 	// Populated by both bd show --json and the in-process store path.
 	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Comments []Comment       `json:"comments,omitempty"`
+}
+
+// Comment represents a beads issue comment needed by review evidence checks.
+type Comment struct {
+	ID        string `json:"id"`
+	IssueID   string `json:"issue_id"`
+	Author    string `json:"author"`
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
 }
 
 // HasLabel checks if an issue has a specific label.
@@ -223,6 +237,68 @@ func HasLabel(issue *Issue, label string) bool {
 		}
 	}
 	return false
+}
+
+// ConcreteWorkIssueRejectReason returns why issue is not a concrete source/work
+// issue suitable for completion or merge-request source tracking. Empty means OK.
+func ConcreteWorkIssueRejectReason(issue *Issue) string {
+	if issue == nil || strings.TrimSpace(issue.ID) == "" {
+		return "source-missing"
+	}
+	if issue.Ephemeral {
+		return "ephemeral"
+	}
+	issueID := strings.ToLower(strings.TrimSpace(issue.ID))
+	if strings.Contains(issueID, "-wisp-") {
+		return "wisp-id"
+	}
+	if strings.HasPrefix(issueID, "mol-") {
+		return "formula-id"
+	}
+	if InternalIssueType(issue.Type) {
+		return "internal-type:" + strings.ToLower(strings.TrimSpace(issue.Type))
+	}
+	for _, label := range issue.Labels {
+		if InternalIssueLabel(label) {
+			return "internal-label:" + strings.ToLower(strings.TrimSpace(label))
+		}
+		if ProtectedIssueLabel(label) {
+			return "protected-label:" + strings.ToLower(strings.TrimSpace(label))
+		}
+	}
+	return ""
+}
+
+// InternalIssueType reports whether an issue type represents Gas Town runtime
+// state rather than user/code work.
+func InternalIssueType(issueType string) bool {
+	switch strings.ToLower(strings.TrimSpace(issueType)) {
+	case "wisp", "message", "handoff", "merge-request", "agent", "queue", "convoy", "formula":
+		return true
+	default:
+		return false
+	}
+}
+
+// InternalIssueLabel reports whether a label marks Gas Town runtime state.
+func InternalIssueLabel(label string) bool {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "gt:wisp", "gt:message", "gt:handoff", "gt:merge-request", "gt:agent", "gt:queue", "gt:convoy", "gt:formula":
+		return true
+	default:
+		return false
+	}
+}
+
+// ProtectedIssueLabel reports whether a label marks a bead that automated
+// completion paths must not close as ordinary work.
+func ProtectedIssueLabel(label string) bool {
+	switch strings.ToLower(strings.TrimSpace(label)) {
+	case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig":
+		return true
+	default:
+		return false
+	}
 }
 
 // HasUncheckedCriteria checks if an issue has acceptance criteria with unchecked items.
@@ -264,8 +340,7 @@ func IsProtectedBead(issue *Issue) bool {
 		return false
 	}
 	for _, l := range issue.Labels {
-		switch l {
-		case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig":
+		if ProtectedIssueLabel(l) {
 			return true
 		}
 	}
@@ -280,6 +355,145 @@ type IssueDep struct {
 	Priority       int    `json:"priority"`
 	Type           string `json:"issue_type"`
 	DependencyType string `json:"dependency_type,omitempty"`
+	CloseReason    string `json:"close_reason,omitempty"`
+}
+
+// UnmarshalJSON accepts both bd dependency relation field names. Some lower-level
+// dependency output uses "type" for the relation, while issue details also have
+// an issue_type field that must remain distinct.
+func (d *IssueDep) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID             string `json:"id"`
+		Title          string `json:"title"`
+		Status         string `json:"status"`
+		Priority       int    `json:"priority"`
+		Type           string `json:"issue_type"`
+		DependencyType string `json:"dependency_type,omitempty"`
+		RelationType   string `json:"type"`
+		CloseReason    string `json:"close_reason,omitempty"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	d.ID = raw.ID
+	d.Title = raw.Title
+	d.Status = raw.Status
+	d.Priority = raw.Priority
+	d.Type = raw.Type
+	d.DependencyType = raw.DependencyType
+	d.CloseReason = raw.CloseReason
+	if strings.TrimSpace(d.DependencyType) == "" {
+		d.DependencyType = knownDependencyRelation(raw.RelationType)
+	}
+	return nil
+}
+
+var blockingDependencyTypes = map[string]bool{
+	"blocks":             true,
+	"conditional-blocks": true,
+	"waits-for":          true,
+	"merge-blocks":       true,
+}
+
+var nonblockingDependencyTypes = map[string]bool{
+	"tracks":          true,
+	"parent-child":    true,
+	"related":         true,
+	"discovered-from": true,
+	"thread":          true,
+}
+
+func knownDependencyRelation(depType string) string {
+	depType = strings.ToLower(strings.TrimSpace(depType))
+	if blockingDependencyTypes[depType] || nonblockingDependencyTypes[depType] {
+		return depType
+	}
+	return ""
+}
+
+// HasUnresolvedBlockers reports whether an issue has any unresolved blocking
+// dependencies. Detailed dependency data takes precedence over list counters.
+func HasUnresolvedBlockers(issue *Issue) bool {
+	_, count := unresolvedBlockingDependencyIDs(issue)
+	return count > 0
+}
+
+// FirstUnresolvedBlockerID returns the first unresolved blocker ID, or empty if
+// the issue is unblocked or only a blocker count is available.
+func FirstUnresolvedBlockerID(issue *Issue) string {
+	ids, _ := unresolvedBlockingDependencyIDs(issue)
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
+func unresolvedBlockingDependencyIDs(issue *Issue) ([]string, int) {
+	if issue == nil {
+		return nil, 0
+	}
+	if len(issue.Dependencies) == 0 {
+		ids := normalizedIssueIDs(issue.BlockedBy)
+		count := len(ids)
+		if issue.BlockedByCount > count {
+			count = issue.BlockedByCount
+		}
+		if issue.DependencyCount > count {
+			count = issue.DependencyCount
+		}
+		return ids, count
+	}
+
+	seen := make(map[string]bool)
+	ids := make([]string, 0, len(issue.Dependencies))
+	count := 0
+	for _, dep := range issue.Dependencies {
+		if !isBlockingDependencyType(dep.DependencyType) || isResolvedDependency(dep) {
+			continue
+		}
+		count++
+		id := ExtractIssueID(dep.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids, count
+}
+
+func normalizedIssueIDs(ids []string) []string {
+	seen := make(map[string]bool, len(ids))
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = ExtractIssueID(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		result = append(result, id)
+	}
+	return result
+}
+
+func isBlockingDependencyType(depType string) bool {
+	return blockingDependencyTypes[strings.ToLower(strings.TrimSpace(depType))]
+}
+
+func isResolvedDependency(dep IssueDep) bool {
+	status := strings.ToLower(strings.TrimSpace(dep.Status))
+	switch status {
+	case "tombstone", "pinned":
+		return true
+	case "closed":
+		if strings.EqualFold(strings.TrimSpace(dep.DependencyType), "merge-blocks") {
+			return strings.HasPrefix(dep.CloseReason, "Merged in ")
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // ListOptions specifies filters for listing issues.
@@ -293,6 +507,7 @@ type ListOptions struct {
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
 	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
+	Rig        string // filter merge-request descriptions by rig before hydration
 }
 
 // CreateOptions specifies options for creating an issue.
@@ -306,7 +521,7 @@ type CreateOptions struct {
 	Parent      string
 	Actor       string // Who is creating this issue (populates created_by)
 	Ephemeral   bool   // Create as ephemeral (wisp) - not synced to git
-	Rig         string // Target rig database (e.g., "gantry"). When set, routes bd create to the rig's directory via --repo.
+	Rig         string // Target rig database (e.g., "gantry"). When set, binds create to the rig's .beads directory.
 }
 
 // UpdateOptions specifies options for updating an issue.
@@ -452,23 +667,28 @@ func (b *Beads) getResolvedBeadsDir() string {
 // targetBeadsDirForCreate returns the database a create operation should use.
 // Rig is authoritative for MR/conflict-task creates; otherwise parent-prefixed
 // children should land beside their parent so bd can resolve the relationship.
-func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) string {
+func (b *Beads) targetBeadsDirForCreate(opts CreateOptions) (string, error) {
 	fallback := b.getResolvedBeadsDir()
 	townRoot := b.getTownRoot()
 
-	if opts.Rig != "" && townRoot != "" {
-		if rigDir := GetRigDirForName(townRoot, opts.Rig); rigDir != "" {
-			if targetDir := ResolveBeadsDir(rigDir); targetDir != "" {
-				return targetDir
+	if opts.Rig != "" {
+		if targetDir, ok := ResolveRepoAliasBeadsDir(townRoot, opts.Rig); ok {
+			if opts.Rig != "hq" && opts.Rig != "town" {
+				prefix := GetPrefixForRig(townRoot, opts.Rig)
+				if err := EnsureConfigYAML(targetDir, prefix); err != nil {
+					return "", fmt.Errorf("ensuring beads config for rig %q: %w", opts.Rig, err)
+				}
 			}
+			return targetDir, nil
 		}
+		return "", fmt.Errorf("unknown repo/rig alias %q", opts.Rig)
 	}
 
 	if opts.Parent != "" {
-		return ResolveRoutingTarget(townRoot, opts.Parent, fallback)
+		return ResolveRoutingTarget(townRoot, opts.Parent, fallback), nil
 	}
 
-	return fallback
+	return fallback, nil
 }
 
 // forIssueID returns a Beads wrapper bound to the correct beads directory for
@@ -487,12 +707,12 @@ func (b *Beads) forIssueID(id string) *Beads {
 		return b
 	}
 	return &Beads{
-		workDir:    b.workDir,
+		workDir:    filepath.Dir(resolved),
 		beadsDir:   resolved,
 		isolated:   b.isolated,
 		serverPort: b.serverPort,
-		store:      b.store,
 		townRoot:   b.townRoot,
+		noRoute:    true,
 	}
 }
 
@@ -722,12 +942,20 @@ func (b *Beads) buildRunEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
+			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_SERVER_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_SERVER_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
 		return SuppressBDSideEffects(env)
 	}
-	return BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
+	// runWithStdin appends BEADS_DIR after probing bd --allow-stale support, so
+	// keep buildRunEnv focused on Dolt target isolation and avoid duplicate
+	// first-match-sensitive BEADS_DIR entries.
+	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
+	env = StripEnvKey(env, "BEADS_DIR")
+	return env
 }
 
 // buildRoutingEnv builds the environment for runWithRouting() calls.
@@ -737,8 +965,11 @@ func (b *Beads) buildRoutingEnv() []string {
 	if b.isolated {
 		env := filterBeadsEnv(os.Environ())
 		if b.serverPort > 0 {
+			env = stripEnvPrefixes(env, "GT_DOLT_PORT=", "BEADS_DOLT_SERVER_PORT=", "BEADS_DOLT_PORT=", "BEADS_DOLT_AUTO_START=")
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
+			env = append(env, fmt.Sprintf("BEADS_DOLT_SERVER_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
 		return SuppressBDSideEffects(env)
 	}
@@ -749,16 +980,24 @@ func (b *Beads) buildRoutingEnv() []string {
 // environment slice. This ensures test isolation by preventing inherited
 // BD_ACTOR, BEADS_DB, GT_ROOT, HOME etc. from routing commands to production databases.
 //
-// Preserves GT_DOLT_PORT, BEADS_DOLT_PORT, and BEADS_DOLT_SERVER_HOST so that
-// isolated-mode tests can reach a test Dolt server on a non-default port/host.
+// Preserves GT_DOLT host/port and Beads Dolt endpoint aliases so isolated-mode
+// tests can reach a test Dolt server on a non-default port/host.
 func filterBeadsEnv(environ []string) []string {
 	filtered := make([]string, 0, len(environ))
 	for _, env := range environ {
+		keyName, _, ok := strings.Cut(env, "=")
+		if !ok {
+			filtered = append(filtered, env)
+			continue
+		}
 		// Preserve Dolt connection env vars needed to reach test/remote Dolt servers.
 		// These must be checked before the broad BEADS_ prefix strip below.
-		if strings.HasPrefix(env, "BEADS_DOLT_PORT=") ||
-			strings.HasPrefix(env, "BEADS_DOLT_SERVER_HOST=") ||
-			strings.HasPrefix(env, "GT_DOLT_PORT=") {
+		if envKeyMatches(keyName, "GT_DOLT_HOST") ||
+			envKeyMatches(keyName, "GT_DOLT_PORT") ||
+			envKeyMatches(keyName, "BEADS_DOLT_PORT") ||
+			envKeyMatches(keyName, "BEADS_DOLT_SERVER_PORT") ||
+			envKeyMatches(keyName, "BEADS_DOLT_SERVER_HOST") ||
+			envKeyMatches(keyName, "BEADS_DOLT_AUTO_START") {
 			filtered = append(filtered, env)
 			continue
 		}
@@ -766,10 +1005,11 @@ func filterBeadsEnv(environ []string) []string {
 		// BD_ACTOR, BEADS_* - direct beads config
 		// GT_ROOT - causes bd to find global routes file
 		// HOME - causes bd to find ~/.beads-planning routing
-		if strings.HasPrefix(env, "BD_ACTOR=") ||
-			strings.HasPrefix(env, "BEADS_") ||
-			strings.HasPrefix(env, "GT_ROOT=") ||
-			strings.HasPrefix(env, "HOME=") {
+		if envKeyMatches(keyName, "BD_ACTOR") ||
+			envKeyHasPrefix(keyName, "BEADS_") ||
+			envKeyMatches(keyName, "GT_DOLT_DATA") ||
+			envKeyMatches(keyName, "GT_ROOT") ||
+			envKeyMatches(keyName, "HOME") {
 			continue
 		}
 		filtered = append(filtered, env)
@@ -777,96 +1017,33 @@ func filterBeadsEnv(environ []string) []string {
 	return filtered
 }
 
-// translateDoltPort ensures BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST are set
-// when their GT_ counterparts are present. Gas Town uses GT_DOLT_PORT and
-// GT_DOLT_HOST; beads uses BEADS_DOLT_PORT and BEADS_DOLT_SERVER_HOST. This
-// translation prevents bd subprocesses from falling back to localhost:3307
-// when a test or daemon has set GT_DOLT_* to alternate values.
-func translateDoltPort(env []string) []string {
-	var gtPort, gtHost string
-	hasBDP, hasBDH := false, false
-	for _, e := range env {
-		if strings.HasPrefix(e, "GT_DOLT_PORT=") {
-			gtPort = strings.TrimPrefix(e, "GT_DOLT_PORT=")
-		}
-		if strings.HasPrefix(e, "GT_DOLT_HOST=") {
-			gtHost = strings.TrimPrefix(e, "GT_DOLT_HOST=")
-		}
-		if strings.HasPrefix(e, "BEADS_DOLT_PORT=") {
-			hasBDP = true
-		}
-		if strings.HasPrefix(e, "BEADS_DOLT_SERVER_HOST=") {
-			hasBDH = true
-		}
-	}
-	if gtPort != "" && !hasBDP {
-		env = append(env, "BEADS_DOLT_PORT="+gtPort)
-	}
-	if gtHost != "" && !hasBDH {
-		env = append(env, "BEADS_DOLT_SERVER_HOST="+gtHost)
-	}
-	return env
-}
-
-// overrideDoltEnvFromBeadsDir replaces inherited BEADS_DOLT_* values with the
-// authoritative connection data for the selected beads directory when present.
-// This prevents a parent shell's stale Dolt port from routing bd commands to
-// the wrong server when the command explicitly targets another rig's .beads dir.
-func overrideDoltEnvFromBeadsDir(env []string, beadsDir string) []string {
-	port, host := doltConnectionFromBeadsDir(beadsDir)
-	if port != "" {
-		env = stripEnvPrefixes(env, "BEADS_DOLT_PORT=")
-		env = append(env, "BEADS_DOLT_PORT="+port)
-	}
-	if host != "" {
-		env = stripEnvPrefixes(env, "BEADS_DOLT_SERVER_HOST=")
-		env = append(env, "BEADS_DOLT_SERVER_HOST="+host)
-	}
-	return env
-}
-
-// doltConnectionFromBeadsDir reads the preferred Dolt connection info for a
-// beads directory. The per-directory port file is authoritative when present;
-// metadata.json is used as a fallback and to supply the server host.
-func doltConnectionFromBeadsDir(beadsDir string) (port string, host string) {
-	if beadsDir == "" {
-		return "", ""
-	}
-
-	if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
-		port = strings.TrimSpace(string(data))
-	}
-
-	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
-	if err != nil {
-		return port, ""
-	}
-
-	var meta struct {
-		DoltServerPort int    `json:"dolt_server_port"`
-		DoltServerHost string `json:"dolt_server_host"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return port, ""
-	}
-
-	if port == "" && meta.DoltServerPort > 0 {
-		port = strconv.Itoa(meta.DoltServerPort)
-	}
-	host = strings.TrimSpace(meta.DoltServerHost)
-	return port, host
-}
-
 // stripEnvPrefixes removes entries matching any of the given prefixes from an
 // environment variable slice. Used by runWithRouting to strip BEADS_DIR.
 func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 	filtered := make([]string, 0, len(environ))
 	for _, env := range environ {
+		keyName, _, ok := strings.Cut(env, "=")
 		skip := false
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(env, prefix) {
-				skip = true
-				break
+		if ok {
+			for _, prefix := range prefixes {
+				if strings.HasSuffix(prefix, "=") {
+					if envKeyMatches(keyName, strings.TrimSuffix(prefix, "=")) {
+						skip = true
+						break
+					}
+					continue
+				}
+				if envKeyHasPrefix(keyName, prefix) {
+					skip = true
+					break
+				}
+			}
+		} else {
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(env, prefix) {
+					skip = true
+					break
+				}
 			}
 		}
 		if !skip {
@@ -881,13 +1058,16 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	if b.store != nil && !opts.Ephemeral {
+	if b.store != nil {
 		return b.storeList(opts)
 	}
 	if opts.Ephemeral {
 		return b.listEphemeral(opts)
 	}
+	return b.listIssues(opts)
+}
 
+func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -938,6 +1118,61 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	return issues, nil
 }
 
+// ListIssueStatuses returns durable issues matching any of the supplied
+// statuses with one bd query. Summary paths use this to avoid multiplying bd
+// subprocesses by status and polecat count.
+func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	unique := make([]IssueStatus, 0, len(statuses))
+	seen := make(map[IssueStatus]bool, len(statuses))
+	for _, status := range statuses {
+		if status == "" || seen[status] {
+			continue
+		}
+		seen[status] = true
+		unique = append(unique, status)
+	}
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	if b.store != nil {
+		var all []*Issue
+		for _, status := range unique {
+			issues, err := b.storeList(ListOptions{Status: string(status), Priority: -1})
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, issues...)
+		}
+		return all, nil
+	}
+
+	statusClauses := make([]string, 0, len(unique))
+	for _, status := range unique {
+		statusClauses = append(statusClauses, "status="+quoteBDQueryValue(string(status)))
+	}
+	expr := "ephemeral=false AND (" + strings.Join(statusClauses, " OR ") + ")"
+	out, err := b.run("query", "--json", expr, "--all", "--limit=0")
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if !isJSONBytes(out) {
+		return nil, fmt.Errorf("bd query returned non-JSON output")
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd query output: %w", err)
+	}
+	return issues, nil
+}
+
 // listEphemeral searches the wisps table using "bd query" with ephemeral=true.
 // This is necessary because "bd list" only searches the issues table and does
 // not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
@@ -947,21 +1182,21 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	clauses := []string{"ephemeral=true"}
 
 	if opts.Label != "" {
-		clauses = append(clauses, "label="+opts.Label)
+		clauses = append(clauses, "label="+quoteBDQueryValue(opts.Label))
 	} else if opts.Type != "" {
-		clauses = append(clauses, "label=gt:"+opts.Type)
+		clauses = append(clauses, "label="+quoteBDQueryValue("gt:"+opts.Type))
 	}
 	if opts.Status != "" && opts.Status != "all" {
-		clauses = append(clauses, "status="+opts.Status)
+		clauses = append(clauses, "status="+quoteBDQueryValue(opts.Status))
 	}
 	if opts.Priority >= 0 {
 		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
 	if opts.Parent != "" {
-		clauses = append(clauses, "parent="+opts.Parent)
+		clauses = append(clauses, "parent="+quoteBDQueryValue(opts.Parent))
 	}
 	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+opts.Assignee)
+		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
@@ -972,6 +1207,9 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 	if opts.Limit > 0 {
 		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+	} else {
+		// Match List's no-truncation default; bd query otherwise silently caps at 50.
+		args = append(args, "--limit=0")
 	}
 
 	out, err := b.run(args...)
@@ -989,6 +1227,10 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	}
 
 	return issues, nil
+}
+
+func quoteBDQueryValue(value string) string {
+	return strconv.Quote(value)
 }
 
 // stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.
@@ -1036,7 +1278,8 @@ func isJSONBytes(b []byte) bool {
 // ListMergeRequests returns merge-request beads from both the issues table
 // and the wisps table. MRs are created as ephemeral (wisps) by gt mq submit,
 // but bd list only queries the issues table. This method queries the wisps
-// table via bd sql --json to get full data including labels and assignee.
+// table via bd sql --json, then hydrates each MR with bd show detail so
+// dependency readiness fields are consistent for display and selection.
 func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 	// 1. Query issues table (bd list) — don't use Ephemeral since bd query
 	// can't parse colons in label values like "gt:merge-request".
@@ -1115,7 +1358,97 @@ func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
 		}
 	}
 
-	return issueResults, nil
+	issueResults = filterMergeRequestsByRig(issueResults, opts.Rig)
+	return b.hydrateMergeRequestDetails(issueResults)
+}
+
+func filterMergeRequestsByRig(issues []*Issue, rigName string) []*Issue {
+	if rigName == "" || len(issues) == 0 {
+		return issues
+	}
+	filtered := make([]*Issue, 0, len(issues))
+	for _, issue := range issues {
+		fields := ParseMRFields(issue)
+		if fields != nil && fields.Rig != "" && !strings.EqualFold(fields.Rig, rigName) {
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered
+}
+
+func (b *Beads) hydrateMergeRequestDetails(issues []*Issue) ([]*Issue, error) {
+	if len(issues) == 0 {
+		return issues, nil
+	}
+
+	ids := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		if issue != nil && issue.ID != "" {
+			ids = append(ids, issue.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return issues, nil
+	}
+
+	details, err := b.ShowMultiple(ids)
+	if err != nil {
+		return nil, fmt.Errorf("hydrating merge-request dependencies: %w", err)
+	}
+
+	hydrated := make([]*Issue, 0, len(issues))
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			hydrated = append(hydrated, issue)
+			continue
+		}
+
+		detail, ok := details[issue.ID]
+		if !ok || detail == nil {
+			return nil, fmt.Errorf("hydrating merge-request dependencies: %s: %w", issue.ID, ErrNotFound)
+		}
+
+		mergeListIssueFields(detail, issue)
+		normalizeUnresolvedBlockers(detail)
+		hydrated = append(hydrated, detail)
+	}
+
+	return hydrated, nil
+}
+
+func mergeListIssueFields(detail, listed *Issue) {
+	detail.Ephemeral = detail.Ephemeral || listed.Ephemeral
+	if detail.Title == "" {
+		detail.Title = listed.Title
+	}
+	if detail.Description == "" {
+		detail.Description = listed.Description
+	}
+	if detail.Status == "" {
+		detail.Status = listed.Status
+	}
+	if detail.Assignee == "" {
+		detail.Assignee = listed.Assignee
+	}
+	if detail.CreatedAt == "" {
+		detail.CreatedAt = listed.CreatedAt
+	}
+	if detail.UpdatedAt == "" {
+		detail.UpdatedAt = listed.UpdatedAt
+	}
+	if detail.CreatedBy == "" {
+		detail.CreatedBy = listed.CreatedBy
+	}
+	if len(detail.Labels) == 0 {
+		detail.Labels = listed.Labels
+	}
+}
+
+func normalizeUnresolvedBlockers(issue *Issue) {
+	ids, count := unresolvedBlockingDependencyIDs(issue)
+	issue.BlockedBy = ids
+	issue.BlockedByCount = count
 }
 
 // ListByAssignee returns all issues assigned to a specific assignee.
@@ -1221,13 +1554,8 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 
 // Show returns detailed information about an issue.
 func (b *Beads) Show(id string) (*Issue, error) {
-	// Route cross-rig queries via routes.jsonl so that rig-level bead IDs
-	// (e.g., "gt-abc123") resolve to the correct rig database.
-	// noRoute (see ForAgentBead) bypasses this for agent-bead lookups.
 	if !b.noRoute {
-		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, b.getResolvedBeadsDir())
-		if targetDir != b.getResolvedBeadsDir() {
-			target := NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+		if target := b.forIssueID(id); target != b {
 			return target.Show(id)
 		}
 	}
@@ -1284,9 +1612,49 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 	return newest, nil
 }
 
-// ShowMultiple fetches multiple issues by ID in a single bd call.
+// ShowMultiple fetches multiple issues by ID, grouped by routed database.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
+// If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Issue), nil
+	}
+
+	if !b.noRoute {
+		fallbackDir := b.getResolvedBeadsDir()
+		groups := make(map[string][]string)
+		for _, id := range ids {
+			targetDir := ResolveRoutingTarget(b.getTownRoot(), id, fallbackDir)
+			groups[targetDir] = append(groups[targetDir], id)
+		}
+
+		if len(groups) > 1 || groups[fallbackDir] == nil {
+			result := make(map[string]*Issue, len(ids))
+			var firstErr error
+			for targetDir, groupIDs := range groups {
+				target := b
+				if targetDir != fallbackDir {
+					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
+				}
+				issues, err := target.showMultipleLocal(groupIDs)
+				if err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				for id, issue := range issues {
+					result[id] = issue
+				}
+			}
+			return result, firstErr
+		}
+	}
+
+	return b.showMultipleLocal(ids)
+}
+
+func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}
@@ -1343,7 +1711,10 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
 	}
 
-	targetDir := b.targetBeadsDirForCreate(opts)
+	targetDir, err := b.targetBeadsDirForCreate(opts)
+	if err != nil {
+		return nil, err
+	}
 	if targetDir != "" && targetDir != b.getResolvedBeadsDir() {
 		bdForCreate := &Beads{
 			workDir:    b.workDir,
@@ -1413,6 +1784,20 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	// Guard against flag-like titles (gt-e0kx5: --help garbage beads)
 	if IsFlagLikeTitle(opts.Title) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
+	}
+
+	targetDir, err := b.targetBeadsDirForCreate(opts)
+	if err != nil {
+		return nil, err
+	}
+	if targetDir != "" && targetDir != b.getResolvedBeadsDir() {
+		bdForCreate := &Beads{
+			workDir:    b.workDir,
+			beadsDir:   targetDir,
+			serverPort: b.serverPort,
+			isolated:   b.isolated,
+		}
+		return bdForCreate.CreateWithID(id, opts)
 	}
 
 	args := []string{"create", "--json", "--id=" + id}
@@ -1578,11 +1963,18 @@ func normalizeBugTitle(title string) string {
 
 // Update updates an existing issue.
 func (b *Beads) Update(id string, opts UpdateOptions) error {
+	if !b.noRoute {
+		if target := b.forIssueID(id); target != b {
+			return target.Update(id, opts)
+		}
+	}
+
 	if b.store != nil {
 		return b.storeUpdate(id, opts)
 	}
 
 	args := []string{"update", id}
+	var stdinData []byte
 
 	if opts.Title != nil {
 		args = append(args, "--title="+*opts.Title)
@@ -1594,7 +1986,12 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		args = append(args, fmt.Sprintf("--priority=%d", *opts.Priority))
 	}
 	if opts.Description != nil {
-		args = append(args, "--description="+*opts.Description)
+		args = append(args, "--body-file=-")
+		stdinData = []byte(*opts.Description)
+		if *opts.Description == "" {
+			args = append(args, "--allow-empty-description")
+			stdinData = []byte{}
+		}
 	}
 	if opts.Assignee != nil {
 		args = append(args, "--assignee="+*opts.Assignee)
@@ -1613,76 +2010,133 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	_, err := b.run(args...)
+	_, err := b.runWithStdin(stdinData, args...)
 	return err
+}
+
+// AddComment appends a comment to an issue, routing by issue ID when needed.
+func (b *Beads) AddComment(id, comment string) error {
+	if !b.noRoute {
+		if target := b.forIssueID(id); target != b {
+			return target.AddComment(id, comment)
+		}
+	}
+
+	_, err := b.run("comments", "add", id, comment)
+	return err
+}
+
+// Comments returns comments for an issue, routing by issue ID when needed.
+func (b *Beads) Comments(id string) ([]Comment, error) {
+	if !b.noRoute {
+		if target := b.forIssueID(id); target != b {
+			return target.Comments(id)
+		}
+	}
+
+	if b.store != nil {
+		comments, err := b.store.GetIssueComments(context.Background(), id)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]Comment, 0, len(comments))
+		for _, comment := range comments {
+			converted, ok := sdkCommentToComment(comment)
+			if ok {
+				out = append(out, converted)
+			}
+		}
+		return out, nil
+	}
+
+	out, err := b.run("comments", id, "--json")
+	if err != nil {
+		return nil, err
+	}
+	var comments []Comment
+	if err := json.Unmarshal(out, &comments); err != nil {
+		return nil, fmt.Errorf("parsing comments: %w", err)
+	}
+	return comments, nil
+}
+
+func (b *Beads) deleteBead(id string) error {
+	_, err := b.run("delete", id, "--force")
+	return err
+}
+
+type closeOptions struct {
+	reason     string
+	withReason bool
+	force      bool
 }
 
 // Close closes one or more issues.
 // If a runtime session ID is set in the environment, it is passed to bd close
 // for work attribution tracking (see decision 009-session-events-architecture.md).
 func (b *Beads) Close(ids ...string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	if b.store != nil {
-		return b.storeClose("", runtime.SessionIDFromEnv(), ids...)
-	}
-
-	args := append([]string{"close"}, ids...)
-
-	// Pass session ID for work attribution if available
-	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
-		args = append(args, "--session="+sessionID)
-	}
-
-	_, err := b.run(args...)
-	return err
+	return b.closeWithOptions(closeOptions{}, ids...)
 }
 
 // CloseWithReason closes one or more issues with a reason.
 // If a runtime session ID is set in the environment, it is passed to bd close
 // for work attribution tracking (see decision 009-session-events-architecture.md).
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-
-	if b.store != nil {
-		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
-	}
-
-	args := append([]string{"close"}, ids...)
-	args = append(args, "--reason="+reason)
-
-	// Pass session ID for work attribution if available
-	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
-		args = append(args, "--session="+sessionID)
-	}
-
-	_, err := b.run(args...)
-	return err
+	return b.closeWithOptions(closeOptions{reason: reason, withReason: true}, ids...)
 }
 
 // ForceCloseWithReason closes one or more issues with --force, bypassing
 // dependency checks. Used by gt done where the polecat is about to be nuked
 // and open molecule wisps should not block issue closure.
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
+	return b.closeWithOptions(closeOptions{reason: reason, withReason: true, force: true}, ids...)
+}
+
+func (b *Beads) closeWithOptions(opts closeOptions, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
 
+	if !b.noRoute {
+		groups := make(map[string][]string)
+		targets := make(map[string]*Beads)
+		currentDir := b.getResolvedBeadsDir()
+		for _, id := range ids {
+			target := b.forIssueID(id)
+			targetDir := target.getResolvedBeadsDir()
+			groups[targetDir] = append(groups[targetDir], id)
+			targets[targetDir] = target
+		}
+		if len(groups) > 1 || groups[currentDir] == nil {
+			for targetDir, groupIDs := range groups {
+				if err := targets[targetDir].closeInCurrentDB(opts, groupIDs...); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
+	return b.closeInCurrentDB(opts, ids...)
+}
+
+func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
 	// In-process store close doesn't enforce dependency checks (no --force
 	// needed). Note: this means the store path bypasses the dependency
 	// validation that the CLI's --force flag overrides. Callers relying on
 	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
 	// accepting that deps may remain dangling, so this is intentional.
 	if b.store != nil {
-		return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		return b.storeClose(opts.reason, runtime.SessionIDFromEnv(), ids...)
 	}
 
 	args := append([]string{"close"}, ids...)
-	args = append(args, "--reason="+reason, "--force")
+	if opts.withReason {
+		args = append(args, "--reason="+opts.reason)
+	}
+	if opts.force {
+		args = append(args, "--force")
+	}
 
 	// Pass session ID for work attribution if available
 	if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {

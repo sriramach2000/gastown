@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -16,7 +17,32 @@ import (
 const (
 	// bdMolTimeout is the timeout for bd molecule operations.
 	bdMolTimeout = 15 * time.Second
+
+	// dogCloseMaxAttempts / dogCloseRetryDelay bound the retry on `bd close` for
+	// dog wisps. A transient Dolt slowdown (the connection-churn window) can make
+	// a single close fail, and without a retry the wisp stays OPEN forever — a
+	// root cause of the dog wisp flood (gt-ye21). Retrying turns a transient
+	// failure back into a clean close instead of a permanent orphan.
+	dogCloseMaxAttempts = 3
+	dogCloseRetryDelay  = 500 * time.Millisecond
 )
+
+// closeWisp runs `bd close <id>` (plus any extra args) with bounded retries so a
+// transient Dolt error does not leave the wisp open. Returns the final error if
+// every attempt fails.
+func (dm *dogMol) closeWisp(id string, extra ...string) error {
+	args := append([]string{"close", id}, extra...)
+	var err error
+	for attempt := 1; attempt <= dogCloseMaxAttempts; attempt++ {
+		if _, err = dm.runBd(args...); err == nil {
+			return nil
+		}
+		if attempt < dogCloseMaxAttempts {
+			time.Sleep(time.Duration(attempt) * dogCloseRetryDelay)
+		}
+	}
+	return err
+}
 
 // dogMol tracks a molecule (wisp) lifecycle for a daemon dog patrol.
 // Graceful degradation: if bd fails, the dog still does its work — molecule
@@ -79,9 +105,8 @@ func (dm *dogMol) closeStep(stepSlug string) {
 		return
 	}
 
-	_, err := dm.runBd("close", stepID)
-	if err != nil {
-		dm.logger.Printf("dog_molecule: close step %s (%s) failed (non-fatal): %v", stepSlug, stepID, err)
+	if err := dm.closeWisp(stepID); err != nil {
+		dm.logger.Printf("dog_molecule: close step %s (%s) failed after %d attempts (non-fatal): %v", stepSlug, stepID, dogCloseMaxAttempts, err)
 		return
 	}
 }
@@ -98,9 +123,8 @@ func (dm *dogMol) failStep(stepSlug, reason string) {
 		return
 	}
 
-	_, err := dm.runBd("close", stepID, "--reason", reason)
-	if err != nil {
-		dm.logger.Printf("dog_molecule: fail step %s (%s) failed (non-fatal): %v", stepSlug, stepID, err)
+	if err := dm.closeWisp(stepID, "--reason", reason); err != nil {
+		dm.logger.Printf("dog_molecule: fail step %s (%s) failed after %d attempts (non-fatal): %v", stepSlug, stepID, dogCloseMaxAttempts, err)
 	}
 }
 
@@ -115,9 +139,8 @@ func (dm *dogMol) close() {
 	// Close any step wisps that were never explicitly closed/failed.
 	dm.closeRemainingSteps()
 
-	_, err := dm.runBd("close", dm.rootID)
-	if err != nil {
-		dm.logger.Printf("dog_molecule: close root %s failed (non-fatal): %v", dm.rootID, err)
+	if err := dm.closeWisp(dm.rootID); err != nil {
+		dm.logger.Printf("dog_molecule: close root %s failed after %d attempts (non-fatal): %v", dm.rootID, dogCloseMaxAttempts, err)
 	}
 }
 
@@ -148,8 +171,8 @@ func (dm *dogMol) closeRemainingSteps() {
 		}
 		// Close any child that is still open/hooked/in_progress.
 		if child.Status == "open" || child.Status == "hooked" || child.Status == "in_progress" {
-			if _, err := dm.runBd("close", child.ID); err != nil {
-				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed: %v", child.ID, err)
+			if err := dm.closeWisp(child.ID); err != nil {
+				dm.logger.Printf("dog_molecule: closeRemainingSteps: close %s failed after %d attempts: %v", child.ID, dogCloseMaxAttempts, err)
 			} else {
 				closed++
 			}
@@ -240,25 +263,66 @@ type childInfo struct {
 }
 
 // parseChildrenJSON parses the output of `bd show <id> --children --json`.
-// bd returns a map keyed by parent ID: {"hq-wisp-abc": [{...}, ...]}.
-// For forward compatibility, a bare array is also accepted.
+// bd returns a map keyed by parent ID plus envelope metadata:
+// {"hq-wisp-abc": [{...}, ...], "schema_version": 1}.
+// For legacy compatibility, a bare array is also accepted.
 func parseChildrenJSON(raw string) ([]childInfo, error) {
-	data := []byte(raw)
+	data := bytes.TrimSpace([]byte(raw))
+	if len(data) == 0 {
+		return nil, fmt.Errorf("empty children JSON")
+	}
 
 	var arr []childInfo
-	if err := json.Unmarshal(data, &arr); err == nil {
+	if data[0] == '[' {
+		if err := json.Unmarshal(data, &arr); err != nil {
+			return nil, err
+		}
 		return arr, nil
 	}
 
-	var wrapped map[string][]childInfo
-	if err := json.Unmarshal(data, &wrapped); err == nil {
-		for _, children := range wrapped {
-			return children, nil
-		}
-		return nil, nil
+	if data[0] != '{' {
+		return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)
 	}
 
-	return nil, fmt.Errorf("unrecognized JSON shape: %.200s", raw)
+	var wrapped map[string]json.RawMessage
+	if err := json.Unmarshal(data, &wrapped); err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(wrapped))
+	for key := range wrapped {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var children []childInfo
+	sawChildArray := false
+	for _, key := range keys {
+		if key == "schema_version" {
+			continue
+		}
+
+		value := bytes.TrimSpace(wrapped[key])
+		if len(value) == 0 {
+			return nil, fmt.Errorf("empty child payload for key %q", key)
+		}
+		if value[0] != '[' {
+			return nil, fmt.Errorf("non-array child payload for key %q", key)
+		}
+
+		var group []childInfo
+		if err := json.Unmarshal(value, &group); err != nil {
+			return nil, fmt.Errorf("parse child array for key %q: %w", key, err)
+		}
+		children = append(children, group...)
+		sawChildArray = true
+	}
+
+	if !sawChildArray {
+		return nil, fmt.Errorf("children JSON object has no child arrays")
+	}
+
+	return children, nil
 }
 
 // knownSteps returns the list of known step slugs for debugging.

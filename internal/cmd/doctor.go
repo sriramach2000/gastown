@@ -149,7 +149,39 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 		NoStart:         doctorNoStart,
 	}
 
-	// Create doctor and register checks
+	d := newDoctorForCommand(doctorRig)
+
+	// Parse slow threshold (0 = disabled)
+	var slowThreshold time.Duration
+	if doctorSlow != "" {
+		var err error
+		slowThreshold, err = time.ParseDuration(doctorSlow)
+		if err != nil {
+			return fmt.Errorf("invalid --slow duration %q: %w", doctorSlow, err)
+		}
+	}
+
+	// Run checks with streaming output
+	fmt.Println() // Initial blank line
+	var report *doctor.Report
+	if doctorFix {
+		report = d.FixStreaming(ctx, os.Stdout, slowThreshold)
+	} else {
+		report = d.RunStreaming(ctx, os.Stdout, slowThreshold)
+	}
+
+	// Print summary (checks were already printed during streaming)
+	report.PrintSummaryOnly(os.Stdout, doctorVerbose, slowThreshold)
+
+	// Exit with error code if there are errors
+	if report.HasErrors() {
+		return fmt.Errorf("doctor found %d error(s)", report.Summary.Errors)
+	}
+
+	return nil
+}
+
+func newDoctorForCommand(rig string) *doctor.Doctor {
 	d := doctor.NewDoctor()
 
 	// Register workspace-level checks first (fundamental)
@@ -194,7 +226,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewOverlayHealthCheck())
 	d.Register(doctor.NewPrefixConflictCheck())
 	d.Register(doctor.NewRigNameMismatchCheck())
-	d.Register(doctor.NewRigConfigSyncCheck()) // Check all registered rigs have config.json
+	d.Register(doctor.NewRigConfigSyncCheck())      // Check all registered rigs have config.json
 	d.Register(doctor.NewStaleDoltPortCheck())      // Check for stale Dolt port files
 	d.Register(doctor.NewStaleSQLServerInfoCheck()) // Check for stale sql-server.info files (GH#2770)
 	d.Register(doctor.NewPrefixMismatchCheck())
@@ -285,36 +317,9 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	d.Register(doctor.NewWorktreeGitdirCheck())
 
 	// Rig-specific checks (only when --rig is specified)
-	if doctorRig != "" {
+	if rig != "" {
 		d.RegisterAll(doctor.RigChecks()...)
 	}
 
-	// Parse slow threshold (0 = disabled)
-	var slowThreshold time.Duration
-	if doctorSlow != "" {
-		var err error
-		slowThreshold, err = time.ParseDuration(doctorSlow)
-		if err != nil {
-			return fmt.Errorf("invalid --slow duration %q: %w", doctorSlow, err)
-		}
-	}
-
-	// Run checks with streaming output
-	fmt.Println() // Initial blank line
-	var report *doctor.Report
-	if doctorFix {
-		report = d.FixStreaming(ctx, os.Stdout, slowThreshold)
-	} else {
-		report = d.RunStreaming(ctx, os.Stdout, slowThreshold)
-	}
-
-	// Print summary (checks were already printed during streaming)
-	report.PrintSummaryOnly(os.Stdout, doctorVerbose, slowThreshold)
-
-	// Exit with error code if there are errors
-	if report.HasErrors() {
-		return fmt.Errorf("doctor found %d error(s)", report.Summary.Errors)
-	}
-
-	return nil
+	return d
 }

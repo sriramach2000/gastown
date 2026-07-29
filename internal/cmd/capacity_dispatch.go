@@ -73,9 +73,95 @@ var fireCrossRigEscalation = func(rig, prefix, beadID string) {
 // before a sling context is closed as circuit-broken.
 const maxDispatchFailures = 3
 
+type schedulerDispatchPlan struct {
+	State       *capacity.SchedulerState
+	MaxPolecats int
+	BatchSize   int
+	SpawnDelay  time.Duration
+	Capacity    polecatCapacitySnapshot
+	Scheduled   []scheduledBeadInfo
+	Ready       []capacity.PendingBead
+	Plan        capacity.DispatchPlan
+}
+
+func buildSchedulerDispatchPlan(townRoot string, batchOverride int, cleanup bool) (*schedulerDispatchPlan, error) {
+	state, err := capacity.LoadState(townRoot)
+	if err != nil {
+		return nil, fmt.Errorf("loading scheduler state: %w", err)
+	}
+
+	settingsPath := config.TownSettingsPath(townRoot)
+	settings, err := config.LoadOrCreateTownSettings(settingsPath)
+	if err != nil {
+		return nil, fmt.Errorf("loading town settings: %w", err)
+	}
+	schedulerCfg := settings.Scheduler
+	if schedulerCfg == nil {
+		schedulerCfg = capacity.DefaultSchedulerConfig()
+	}
+
+	maxPolecats := schedulerCfg.GetMaxPolecats()
+	batchSize := schedulerCfg.GetBatchSize()
+	if batchOverride > 0 {
+		batchSize = batchOverride
+	}
+	spawnDelay := schedulerCfg.GetSpawnDelay()
+
+	if cleanup && !state.Paused && maxPolecats > 0 {
+		if err := cleanupStaleContexts(townRoot); err != nil {
+			return nil, fmt.Errorf("cleaning stale scheduler contexts: %w", err)
+		}
+	}
+
+	assessments, blockedErr := assessScheduledContexts(townRoot)
+	if blockedErr != nil {
+		return nil, blockedErr
+	}
+
+	snapshot, err := polecatCapacitySnapshotForTownNoCleanup(townRoot)
+	if cleanup {
+		snapshot, err = polecatCapacitySnapshotForTown(townRoot)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("loading polecat capacity: %w", err)
+	}
+
+	ready := readySlingContextsFromAssessments(assessments)
+	dispatchPlan := capacity.PlanDispatch(snapshot.Free, batchSize, ready)
+	if len(ready) > 0 {
+		switch {
+		case state.Paused:
+			dispatchPlan = capacity.DispatchPlan{Skipped: len(ready), Reason: "paused"}
+		case maxPolecats <= 0:
+			dispatchPlan = capacity.DispatchPlan{Skipped: len(ready), Reason: "direct-mode"}
+		}
+	}
+
+	return &schedulerDispatchPlan{
+		State:       state,
+		MaxPolecats: maxPolecats,
+		BatchSize:   batchSize,
+		SpawnDelay:  spawnDelay,
+		Capacity:    snapshot,
+		Scheduled:   scheduledBeadInfosFromAssessments(assessments),
+		Ready:       ready,
+		Plan:        dispatchPlan,
+	}, nil
+}
+
 // dispatchScheduledWork is the main dispatch loop for the capacity scheduler.
 // Called by both `gt scheduler run` and the daemon heartbeat.
 func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun bool) (int, error) {
+	if dryRun {
+		dispatchPlan, err := buildSchedulerDispatchPlan(townRoot, batchOverride, false)
+		if err != nil {
+			return 0, fmt.Errorf("planning dispatch: %w", err)
+		}
+		dispatchPlan.Plan = validateDryRunDispatchPlan(townRoot, dispatchPlan.Plan)
+		printSchedulerDryRunPlan(dispatchPlan)
+		return 0, nil
+	}
+
 	// Acquire exclusive lock to prevent concurrent dispatch
 	runtimeDir := filepath.Join(townRoot, ".runtime")
 	_ = os.MkdirAll(runtimeDir, 0755)
@@ -86,61 +172,39 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		return 0, fmt.Errorf("acquiring dispatch lock: %w", err)
 	}
 	if !locked {
-		return 0, nil
+		if isDaemonDispatch() {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("scheduler dispatch already in progress (lock held: %s)", lockFile)
 	}
 	defer func() { _ = fileLock.Unlock() }()
 
-	// Load scheduler state
-	state, err := capacity.LoadState(townRoot)
+	dispatchPlan, err := buildSchedulerDispatchPlan(townRoot, batchOverride, true)
 	if err != nil {
-		return 0, fmt.Errorf("loading scheduler state: %w", err)
+		return 0, fmt.Errorf("planning dispatch: %w", err)
 	}
 
-	if state.Paused {
-		if !dryRun {
-			fmt.Printf("%s Scheduler is paused (by %s), skipping dispatch\n", style.Dim.Render("⏸"), state.PausedBy)
+	if dispatchPlan.State.Paused {
+		if !isDaemonDispatch() {
+			fmt.Printf("%s Scheduler is paused (by %s), skipping %d ready bead(s)\n",
+				style.Dim.Render("⏸"), dispatchPlan.State.PausedBy, len(dispatchPlan.Ready))
 		}
 		return 0, nil
-	}
-
-	// Load town settings for scheduler config
-	settingsPath := config.TownSettingsPath(townRoot)
-	settings, err := config.LoadOrCreateTownSettings(settingsPath)
-	if err != nil {
-		return 0, fmt.Errorf("loading town settings: %w", err)
-	}
-
-	schedulerCfg := settings.Scheduler
-	if schedulerCfg == nil {
-		schedulerCfg = capacity.DefaultSchedulerConfig()
 	}
 
 	// Nothing to dispatch when scheduler is in direct dispatch or disabled mode.
-	maxPolecats := schedulerCfg.GetMaxPolecats()
-	if maxPolecats <= 0 {
-		if !dryRun && !isDaemonDispatch() {
-			staleBeads, _ := getReadySlingContexts(townRoot)
-			if len(staleBeads) > 0 {
+	if dispatchPlan.MaxPolecats <= 0 {
+		if !isDaemonDispatch() {
+			if len(dispatchPlan.Scheduled) > 0 {
 				fmt.Printf("%s %d context bead(s) still open from a previous deferred mode\n",
-					style.Warning.Render("⚠"), len(staleBeads))
+					style.Warning.Render("⚠"), len(dispatchPlan.Scheduled))
 				fmt.Printf("  Use: gt scheduler clear  (close all sling context beads)\n")
 				fmt.Printf("  Or:  gt config set scheduler.max_polecats N  (re-enable deferred dispatch)\n")
+			} else {
+				fmt.Println("No ready beads scheduled for dispatch")
 			}
 		}
 		return 0, nil
-	}
-
-	// Determine limits
-	batchSize := schedulerCfg.GetBatchSize()
-	if batchOverride > 0 {
-		batchSize = batchOverride
-	}
-	spawnDelay := schedulerCfg.GetSpawnDelay()
-
-	// Clean up invalid/stale contexts before querying for ready beads.
-	// Skip during dry-run to avoid mutating state.
-	if !dryRun {
-		cleanupStaleContexts(townRoot)
 	}
 
 	// Wire up the DispatchCycle
@@ -148,38 +212,8 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 	// Track polecat names from dispatch results, keyed by context bead ID.
 	polecatNames := make(map[string]string)
 	cycle := &capacity.DispatchCycle{
-		AvailableCapacity: func() (int, error) {
-			active := countWorkingPolecats()
-			cap := maxPolecats - active
-			if cap <= 0 {
-				return 0, nil // No free slots — PlanDispatch treats <= 0 as no capacity
-			}
-			return cap, nil
-		},
-		QueryPending: func() ([]capacity.PendingBead, error) {
-			return getReadySlingContexts(townRoot)
-		},
 		Validate: func(b capacity.PendingBead) error {
-			// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does
-			// not match the target rig's registered prefix must not be
-			// dispatched — the polecat would land in a rig DB that cannot
-			// resolve the bead and hang in prime.
-			if b.TargetRig == "" {
-				return nil
-			}
-			rigPath := filepath.Join(townRoot, b.TargetRig)
-			rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
-			if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
-				return nil
-			}
-			gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
-			fmt.Fprintf(os.Stderr,
-				"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
-				style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
-			if shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
-				fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
-			}
-			return capacity.ErrCrossRigPrefix
+			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
 			result, err := dispatchSingleBead(b, townRoot, actor)
@@ -200,10 +234,11 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		OnSuccess: func(b capacity.PendingBead) error {
 			// OnSuccess may be retried — only do the close here, no side effects.
 			// Route to the correct rig's beads dir (GH#3468).
-			return beadsForContext(townRoot, b.Context).CloseSlingContext(b.ID, "dispatched")
+			return beadsForPendingContext(townRoot, b).CloseSlingContext(b.ID, "dispatched")
 		},
 		OnFailure: func(b capacity.PendingBead, err error) {
 			var onSuccessErr *capacity.ErrOnSuccessFailed
+			var admissionErr *polecatCapacityAdmissionError
 			if errors.As(err, &onSuccessErr) {
 				// Polecat launched but context close failed — not a true dispatch failure.
 				// Log a distinct warning so operators can distinguish from "polecat never launched".
@@ -211,7 +246,7 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 					style.Warning.Render("⚠"), b.WorkBeadID, err)
 				// Last-resort close attempt to prevent double-dispatch on next cycle.
 				// OnSuccess already retried 2x; this is a final attempt before circuit-breaking.
-				ctxBeads := beadsForContext(townRoot, b.Context)
+				ctxBeads := beadsForPendingContext(townRoot, b)
 				if closeErr := ctxBeads.CloseSlingContext(b.ID, "dispatch-close-failed"); closeErr != nil {
 					fmt.Fprintf(os.Stderr, "%s CRITICAL: last-resort close of %s failed — risk of double-dispatch for %s: %v\n",
 						style.Warning.Render("⚠"), b.ID, b.WorkBeadID, closeErr)
@@ -223,28 +258,25 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 					// Skip recordDispatchFailure to avoid writing to a closed context.
 					return
 				}
+			} else if errors.As(err, &admissionErr) {
+				fmt.Fprintf(os.Stderr, "%s Capacity full while dispatching %s; leaving context queued: %v\n",
+					style.Dim.Render("○"), b.WorkBeadID, err)
+				return
 			} else {
 				_ = events.LogFeed(events.TypeSchedulerDispatchFailed, actor,
 					events.SchedulerDispatchFailedPayload(b.WorkBeadID, b.TargetRig, err.Error()))
 			}
-			recordDispatchFailure(beadsForContext(townRoot, b.Context), b, err)
+			recordDispatchFailure(beadsForPendingContext(townRoot, b), b, err)
 		},
-		BatchSize:  batchSize,
-		SpawnDelay: spawnDelay,
+		SpawnDelay: dispatchPlan.SpawnDelay,
 	}
 
-	if dryRun {
-		plan, planErr := cycle.Plan()
-		if planErr != nil {
-			return 0, fmt.Errorf("planning dispatch: %w", planErr)
-		}
-		printDryRunPlan(plan, maxPolecats, batchSize)
-		return 0, nil
-	}
-
-	report, err := cycle.Run()
+	report, err := cycle.RunPlan(dispatchPlan.Plan)
 	if err != nil {
 		return 0, fmt.Errorf("dispatch cycle failed: %w", err)
+	}
+	if len(dispatchPlan.Plan.ToDispatch) > 0 && report.Dispatched == 0 && report.Failed == 0 {
+		return 0, fmt.Errorf("scheduler dispatch invariant violation: plan had %d dispatchable bead(s) but no dispatch result", len(dispatchPlan.Plan.ToDispatch))
 	}
 
 	// Wake rig agents for each unique rig that had successful dispatches.
@@ -269,33 +301,68 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		fmt.Printf("\n%s Dispatched %d, failed %d (reason: %s)\n",
 			style.Bold.Render("✓"), report.Dispatched, report.Failed, report.Reason)
 	} else if report.Skipped > 0 {
-		fmt.Printf("\n%s Skipped %d bead(s) — zero capacity (working: %d)\n",
-			style.Dim.Render("○"), report.Skipped, countWorkingPolecats())
+		printDispatchNoOp(report, dispatchPlan.Capacity)
+	} else if !isDaemonDispatch() {
+		printDispatchNoOp(report, dispatchPlan.Capacity)
 	}
 
 	return report.Dispatched, nil
 }
 
+func printSchedulerDryRunPlan(dispatchPlan *schedulerDispatchPlan) {
+	if dispatchPlan.State.Paused {
+		fmt.Printf("Scheduler is paused (by %s); %d ready bead(s) not dispatched\n",
+			dispatchPlan.State.PausedBy, len(dispatchPlan.Ready))
+		return
+	}
+	if dispatchPlan.MaxPolecats <= 0 {
+		if len(dispatchPlan.Scheduled) == 0 {
+			fmt.Println("No ready beads scheduled for dispatch")
+			return
+		}
+		fmt.Printf("Scheduler is in direct dispatch mode (scheduler.max_polecats=%d); %d open context bead(s) will not dispatch\n",
+			dispatchPlan.MaxPolecats, len(dispatchPlan.Scheduled))
+		return
+	}
+	printDryRunPlan(dispatchPlan.Plan, dispatchPlan.Capacity, dispatchPlan.BatchSize)
+}
+
+func printDispatchNoOp(report capacity.DispatchReport, snapshot polecatCapacitySnapshot) {
+	switch report.Reason {
+	case "none":
+		fmt.Println("No ready beads scheduled for dispatch")
+	case "capacity":
+		fmt.Printf("\n%s No capacity: %d ready bead(s) waiting (working: %d recovery_blocked: %d reservations: %d reusable_idle: %d pending_mr: %d)\n",
+			style.Dim.Render("○"), report.Skipped, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle, snapshot.PendingMR)
+	default:
+		fmt.Printf("\n%s No dispatchable beads (reason: %s, skipped: %d)\n",
+			style.Dim.Render("○"), report.Reason, report.Skipped)
+	}
+}
+
 // printDryRunPlan displays a dry-run dispatch plan.
-func printDryRunPlan(plan capacity.DispatchPlan, maxPolecats, batchSize int) {
+func printDryRunPlan(plan capacity.DispatchPlan, snapshot polecatCapacitySnapshot, batchSize int) {
 	if plan.Reason == "none" {
 		fmt.Println("No ready beads scheduled for dispatch")
 		return
 	}
 
-	activePolecats := countActivePolecats()
 	capStr := "unlimited"
-	if maxPolecats > 0 {
-		cap := maxPolecats - activePolecats
-		if cap < 0 {
-			cap = 0
-		}
-		capStr = fmt.Sprintf("%d free of %d", cap, maxPolecats)
+	if snapshot.Max > 0 {
+		capStr = fmt.Sprintf("%d free of %d (working: %d, recovery_blocked: %d, reservations: %d, reusable_idle: %d, pending_mr: %d)",
+			snapshot.Free, snapshot.Max, snapshot.Working, snapshot.RecoveryBlocked, snapshot.Reservations, snapshot.ReusableIdle, snapshot.PendingMR)
 	}
 
 	totalReady := len(plan.ToDispatch) + plan.Skipped
 	if len(plan.ToDispatch) == 0 {
-		fmt.Printf("No capacity: %s, %d ready bead(s) waiting\n", capStr, totalReady)
+		switch plan.Reason {
+		case "capacity":
+			fmt.Printf("No capacity: %s, %d ready bead(s) waiting\n", capStr, totalReady)
+		case "validation":
+			fmt.Printf("No dispatchable beads: validation failed for %d candidate(s)\n", totalReady)
+		default:
+			fmt.Printf("No dispatchable beads: reason=%s, %d candidate(s) skipped\n", plan.Reason, totalReady)
+		}
 		return
 	}
 
@@ -321,25 +388,57 @@ func beadsForContext(townRoot string, fields *capacity.SlingContextFields) *bead
 	return beads.NewWithBeadsDir(townRoot, filepath.Join(townRoot, ".beads"))
 }
 
+func beadsForPendingContext(townRoot string, b capacity.PendingBead) *beads.Beads {
+	if b.ContextBeadsDir != "" {
+		workDir := b.ContextWorkDir
+		if workDir == "" {
+			workDir = filepath.Dir(b.ContextBeadsDir)
+		}
+		return beads.NewWithBeadsDir(workDir, b.ContextBeadsDir)
+	}
+	return beadsForContext(townRoot, b.Context)
+}
+
+type slingContextRecord struct {
+	issue    *beads.Issue
+	workDir  string
+	beadsDir string
+}
+
+type scheduledContextAssessment struct {
+	context        slingContextRecord
+	fields         *capacity.SlingContextFields
+	info           beadStatusInfo
+	found          bool
+	blocked        bool
+	blockedUnknown bool
+	ready          bool
+}
+
+func beadsForContextRecord(rec slingContextRecord) *beads.Beads {
+	return beads.NewWithBeadsDir(rec.workDir, rec.beadsDir)
+}
+
 // cleanupStaleContexts closes invalid and stale sling context beads.
 // Called explicitly before the dispatch cycle to separate cleanup from querying.
-func cleanupStaleContexts(townRoot string) {
-	contexts := listAllSlingContexts(townRoot)
+func cleanupStaleContexts(townRoot string) error {
+	contexts, err := listAllSlingContextRecords(townRoot)
+	if err != nil {
+		return err
+	}
 
 	// First pass: close invalid and circuit-broken contexts, collect work bead IDs
 	// that need status checks for stale detection.
-	var staleCheckContexts []*beads.Issue
+	var staleCheckContexts []slingContextRecord
 	var staleCheckFields []*capacity.SlingContextFields
 	for _, ctx := range contexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
+		fields := beads.ParseSlingContextFields(ctx.issue.Description)
 		if fields == nil {
-			b := beadsForContext(townRoot, nil)
-			_ = b.CloseSlingContext(ctx.ID, "invalid-context")
+			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "invalid-context")
 			continue
 		}
 		if fields.DispatchFailures >= maxDispatchFailures {
-			b := beadsForContext(townRoot, fields)
-			_ = b.CloseSlingContext(ctx.ID, "circuit-broken")
+			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "circuit-broken")
 			continue
 		}
 		staleCheckContexts = append(staleCheckContexts, ctx)
@@ -347,7 +446,7 @@ func cleanupStaleContexts(townRoot string) {
 	}
 
 	if len(staleCheckContexts) == 0 {
-		return
+		return nil
 	}
 
 	// Collect work bead IDs to fetch
@@ -368,10 +467,10 @@ func cleanupStaleContexts(townRoot string) {
 		fields := staleCheckFields[i]
 		info, found := workBeadInfo[fields.WorkBeadID]
 		if found && (info.Status == "hooked" || info.Status == "closed" || info.Status == "tombstone") {
-			b := beadsForContext(townRoot, fields)
-			_ = b.CloseSlingContext(ctx.ID, "stale-work-bead")
+			_ = beadsForContextRecord(ctx).CloseSlingContext(ctx.issue.ID, "stale-work-bead")
 		}
 	}
+	return nil
 }
 
 // beadStatusInfo holds batch-fetched bead status, title, and labels.
@@ -379,6 +478,17 @@ type beadStatusInfo struct {
 	Status string
 	Title  string
 	Labels []string
+}
+
+func beadStatusInfoFromBeadInfo(info *beadInfo) beadStatusInfo {
+	if info == nil {
+		return beadStatusInfo{}
+	}
+	return beadStatusInfo{
+		Status: info.Status,
+		Title:  info.Title,
+		Labels: info.Labels,
+	}
 }
 
 // batchFetchBeadInfoByIDs returns a map of bead ID → status+title+labels for specific beads.
@@ -390,16 +500,16 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 		return result
 	}
 
-	// Group IDs by prefix to route to the correct rig directory
-	// Most IDs will have a common prefix (e.g., "gt-", "bcc-", "hq-")
-	// For simplicity, try all dirs - bd show will return results only for matching IDs
-	for _, dir := range beadsSearchDirs(townRoot) {
+	requestedIDs := uniqueNonEmptyIDs(ids)
+	idsByBeadsDir := groupBeadIDsByResolvedBeadsDir(townRoot, requestedIDs)
+	for beadsDir, groupedIDs := range idsByBeadsDir {
 		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
 		// and BEADS_DOLT_PORT translation (matching how all other bd-invoking
-		// functions work). Raw exec.Command missed these, causing stale/wrong
-		// dolt database queries. See GH#803.
-		b := beads.New(dir)
-		args := append([]string{"show", "--json"}, ids...)
+		// functions work). Route IDs directly instead of trying every beads dir;
+		// scheduler status/list/run sit on operator hot paths, and repeated bd show
+		// fanout dominates latency in large towns.
+		b := beads.NewWithBeadsDir(filepath.Dir(beadsDir), beadsDir)
+		args := append([]string{"show", "--json"}, groupedIDs...)
 		out, err := b.Run(args...)
 		if err != nil {
 			continue
@@ -410,115 +520,163 @@ func batchFetchBeadInfoByIDs(townRoot string, ids []string) map[string]beadStatu
 			Title  string   `json:"title"`
 			Labels []string `json:"labels"`
 		}
-		if err := json.Unmarshal(out, &items); err == nil {
-			for _, item := range items {
-				result[item.ID] = beadStatusInfo{
-					Status: item.Status,
-					Title:  item.Title,
-					Labels: item.Labels,
-				}
+		if err := json.Unmarshal(out, &items); err != nil {
+			continue
+		}
+		for _, item := range items {
+			result[item.ID] = beadStatusInfo{
+				Status: item.Status,
+				Title:  item.Title,
+				Labels: item.Labels,
 			}
 		}
 	}
+
+	for _, id := range requestedIDs {
+		if _, found := result[id]; found {
+			continue
+		}
+		info, err := getBeadInfoFromTownRoot(townRoot, id)
+		if err != nil {
+			continue
+		}
+		result[id] = beadStatusInfoFromBeadInfo(info)
+	}
 	return result
+}
+
+func uniqueNonEmptyIDs(ids []string) []string {
+	result := make([]string, 0, len(ids))
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		result = append(result, id)
+	}
+	return result
+}
+
+func groupBeadIDsByResolvedBeadsDir(townRoot string, ids []string) map[string][]string {
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	idsByBeadsDir := make(map[string][]string)
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		beadsDir := beads.ResolveBeadsDirForID(townBeadsDir, id)
+		key := beadsDir + "\x00" + id
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		idsByBeadsDir[beadsDir] = append(idsByBeadsDir[beadsDir], id)
+	}
+	return idsByBeadsDir
+}
+
+func assessScheduledContexts(townRoot string) ([]scheduledContextAssessment, error) {
+	contexts, err := listAllSlingContextRecords(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	if len(contexts) == 0 {
+		return nil, nil
+	}
+
+	candidates := make([]scheduledContextAssessment, 0, len(contexts))
+	workBeadIDs := make([]string, 0, len(contexts))
+	for _, ctx := range contexts {
+		fields := beads.ParseSlingContextFields(ctx.issue.Description)
+		if fields == nil || fields.WorkBeadID == "" || fields.TargetRig == "" {
+			continue
+		}
+		if fields.DispatchFailures >= maxDispatchFailures {
+			continue
+		}
+		candidates = append(candidates, scheduledContextAssessment{context: ctx, fields: fields})
+		workBeadIDs = append(workBeadIDs, fields.WorkBeadID)
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		fi := candidates[i].fields
+		fj := candidates[j].fields
+		if fi.EnqueuedAt != fj.EnqueuedAt {
+			return fi.EnqueuedAt < fj.EnqueuedAt
+		}
+		return candidates[i].context.issue.ID < candidates[j].context.issue.ID
+	})
+
+	workBeadInfo := batchFetchBeadInfoByIDs(townRoot, workBeadIDs)
+	blockedWorkIDs, blockedUnknownIDs, blockedErr := listBlockedWorkBeadIDStates(townRoot, workBeadIDs)
+
+	seenWork := make(map[string]bool)
+	assessments := make([]scheduledContextAssessment, 0, len(candidates))
+	for _, candidate := range candidates {
+		workBeadID := candidate.fields.WorkBeadID
+		if seenWork[workBeadID] {
+			continue
+		}
+		seenWork[workBeadID] = true
+
+		info, found := workBeadInfo[workBeadID]
+		candidate.info = info
+		candidate.found = found
+		candidate.blocked = blockedWorkIDs[workBeadID]
+		candidate.blockedUnknown = blockedUnknownIDs[workBeadID]
+		candidate.ready = isScheduledWorkBeadReady(workBeadID, info, found, blockedWorkIDs, blockedUnknownIDs)
+		assessments = append(assessments, candidate)
+	}
+
+	return assessments, blockedErr
 }
 
 // getReadySlingContexts queries for sling context beads whose work beads are ready.
 // This is a pure query — no destructive side effects. Call cleanupStaleContexts()
 // before this function to handle invalid/stale contexts.
 //
-// Sling contexts are queried from HQ only (authoritative). Work bead readiness
-// is checked across all rig dirs since work beads live in rig-local DBs.
+// Sling contexts are scanned from HQ and rig DBs. Work bead readiness is checked
+// by source ID so context location and source readiness cannot diverge.
 func getReadySlingContexts(townRoot string) ([]capacity.PendingBead, error) {
-	// 1. List all open sling context beads from HQ (authoritative)
-	allContexts := listAllSlingContexts(townRoot)
-
-	if len(allContexts) == 0 {
-		return nil, nil
+	assessments, blockedErr := assessScheduledContexts(townRoot)
+	if blockedErr != nil {
+		return nil, blockedErr
 	}
+	return readySlingContextsFromAssessments(assessments), nil
+}
 
-	// 2. Build readyWorkIDs set from bd ready across all dirs
-	// (work beads live in rig-local DBs, so we need to check all dirs)
-	readyWorkIDs, readyErr := listReadyWorkBeadIDsWithError(townRoot)
-	if readyErr != nil {
-		return nil, readyErr
-	}
-
-	// 2b. Batch-fetch work bead labels so we can defensively filter messaging
-	// beads (gt:message / gt:handoff / gt:merge-request) that should never be
-	// handed to a polecat. See gt-el4 / gastownhall/gastown#3800.
-	workBeadIDs := make([]string, 0, len(allContexts))
-	for _, ctx := range allContexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
-		if fields == nil {
-			continue
-		}
-		workBeadIDs = append(workBeadIDs, fields.WorkBeadID)
-	}
-	workBeadInfo := batchFetchBeadInfoByIDs(townRoot, workBeadIDs)
-
-	// 3. Build PendingBead list — pure filtering, no mutations.
-	// Sort by EnqueuedAt for deterministic deduplication: when concurrent
-	// scheduleBead calls create multiple contexts for the same work bead,
-	// the oldest context always wins.
-	sort.Slice(allContexts, func(i, j int) bool {
-		fi := beads.ParseSlingContextFields(allContexts[i].Description)
-		fj := beads.ParseSlingContextFields(allContexts[j].Description)
-		if fi == nil || fj == nil {
-			return fi != nil // valid contexts sort before invalid
-		}
-		if fi.EnqueuedAt != fj.EnqueuedAt {
-			return fi.EnqueuedAt < fj.EnqueuedAt
-		}
-		return allContexts[i].ID < allContexts[j].ID // deterministic tiebreaker
-	})
-
-	seenWork := make(map[string]bool)
+func readySlingContextsFromAssessments(assessments []scheduledContextAssessment) []capacity.PendingBead {
 	var result []capacity.PendingBead
-	for _, ctx := range allContexts {
-		fields := beads.ParseSlingContextFields(ctx.Description)
-		if fields == nil {
-			continue // Skip invalid — cleanupStaleContexts handles these
-		}
-
-		// Circuit breaker filter
-		if fields.DispatchFailures >= maxDispatchFailures {
+	for _, assessment := range assessments {
+		if !assessment.ready {
 			continue
 		}
-
-		// Only include if work bead is ready (unblocked)
-		if !readyWorkIDs[fields.WorkBeadID] {
-			continue
-		}
-
-		// Deduplicate: one dispatch per work bead (oldest context wins)
-		if seenWork[fields.WorkBeadID] {
-			continue
-		}
-		seenWork[fields.WorkBeadID] = true
-
-		// Defensive filter: messaging beads (gt:message / gt:handoff /
-		// gt:merge-request) must never reach a rig polecat. Log the skip so
-		// the gap is observable and operators can chase the upstream cause.
-		workLabels := workBeadInfo[fields.WorkBeadID].Labels
+		workLabels := assessment.info.Labels
 		if capacity.IsMessagingBead(workLabels) {
 			fmt.Fprintf(os.Stderr, "%s dispatch_skip reason=messaging_label bead=%s labels=%v\n",
-				style.Dim.Render("○"), fields.WorkBeadID, workLabels)
+				style.Dim.Render("○"), assessment.fields.WorkBeadID, workLabels)
 			continue
 		}
 
 		result = append(result, capacity.PendingBead{
-			ID:          ctx.ID,
-			WorkBeadID:  fields.WorkBeadID,
-			Title:       ctx.Title,
-			TargetRig:   fields.TargetRig,
-			Description: ctx.Description,
-			Labels:      workLabels,
-			Context:     fields,
+			ID:              assessment.context.issue.ID,
+			WorkBeadID:      assessment.fields.WorkBeadID,
+			Title:           assessment.info.Title,
+			TargetRig:       assessment.fields.TargetRig,
+			Description:     assessment.context.issue.Description,
+			Labels:          workLabels,
+			Context:         assessment.fields,
+			ContextWorkDir:  assessment.context.workDir,
+			ContextBeadsDir: assessment.context.beadsDir,
 		})
 	}
 
-	return result, nil
+	return result
 }
 
 // dispatchSingleBead dispatches one scheduled bead via executeSling.
@@ -530,6 +688,14 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 	}
 
 	dp := capacity.ReconstructFromContext(b.Context)
+	targetBeadsDir := filepath.Join(townRoot, ".beads")
+	if dp.RigName != "" {
+		resolved, ok := beads.ResolveRepoAliasBeadsDir(townRoot, dp.RigName)
+		if !ok {
+			return nil, fmt.Errorf("cannot resolve target rig %q beads database for %s", dp.RigName, b.WorkBeadID)
+		}
+		targetBeadsDir = resolved
+	}
 	params := SlingParams{
 		BeadID:           dp.BeadID,
 		RigName:          dp.RigName,
@@ -550,7 +716,7 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 		NoConvoy:         true,
 		NoBoot:           true,
 		TownRoot:         townRoot,
-		BeadsDir:         filepath.Join(townRoot, ".beads"),
+		BeadsDir:         targetBeadsDir,
 	}
 
 	fmt.Printf("  Dispatching %s → %s...\n", b.WorkBeadID, b.TargetRig)
@@ -560,6 +726,63 @@ func dispatchSingleBead(b capacity.PendingBead, townRoot, _ string) (*SlingResul
 	}
 
 	return result, nil
+}
+
+func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) capacity.DispatchPlan {
+	if len(plan.ToDispatch) == 0 {
+		return plan
+	}
+	validated := make([]capacity.PendingBead, 0, len(plan.ToDispatch))
+	for _, b := range plan.ToDispatch {
+		if err := validatePendingBeadForDispatch(townRoot, b, false); err != nil {
+			fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=validation bead=%s target_rig=%s: %v\n",
+				style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
+			plan.Skipped++
+			continue
+		}
+		if _, err := getBeadInfoFromTownRoot(townRoot, b.WorkBeadID); err != nil {
+			fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=bead_lookup bead=%s target_rig=%s: %v\n",
+				style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
+			plan.Skipped++
+			continue
+		}
+		if b.TargetRig != "" {
+			if err := verifyBeadExistsInTargetRigDatabase(b.WorkBeadID, b.TargetRig, townRoot); err != nil {
+				fmt.Fprintf(os.Stderr, "%s dry-run_skip reason=target_db bead=%s target_rig=%s: %v\n",
+					style.Dim.Render("○"), b.WorkBeadID, b.TargetRig, err)
+				plan.Skipped++
+				continue
+			}
+		}
+		validated = append(validated, b)
+	}
+	plan.ToDispatch = validated
+	if len(plan.ToDispatch) == 0 && plan.Reason != "none" {
+		plan.Reason = "validation"
+	}
+	return plan
+}
+
+func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
+	// Cross-rig prefix guard (gt-el4). A bead whose ID prefix does not match the
+	// target rig's registered prefix must not be dispatched — the polecat would
+	// land in a rig DB that cannot resolve the bead and hang in prime.
+	if b.TargetRig == "" {
+		return nil
+	}
+	rigPath := filepath.Join(townRoot, b.TargetRig)
+	rigPrefix := rigBeadsPrefix(townRoot, rigPath, b.TargetRig)
+	if capacity.AcceptsPrefix(rigPrefix, b.WorkBeadID) {
+		return nil
+	}
+	gotPrefix := capacity.BeadIDPrefix(b.WorkBeadID)
+	fmt.Fprintf(os.Stderr,
+		"%s dispatch_refused reason=cross_rig_prefix bead=%s target_rig=%s rig_prefix=%s bead_prefix=%s\n",
+		style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, rigPrefix, gotPrefix)
+	if escalate && shouldFireCrossRigEscalation(b.TargetRig, gotPrefix, time.Now()) {
+		fireCrossRigEscalation(b.TargetRig, gotPrefix, b.WorkBeadID)
+	}
+	return capacity.ErrCrossRigPrefix
 }
 
 // isDaemonDispatch returns true when dispatch is triggered by the daemon heartbeat.
@@ -600,68 +823,105 @@ func recordDispatchFailure(townBeads *beads.Beads, b capacity.PendingBead, dispa
 // Deduplicates by context ID: different search dirs can resolve to the same
 // underlying beads DB (e.g., when a rig's top-level .beads is a redirect to
 // mayor/rig/.beads), and both paths would otherwise return the same contexts.
-func listAllSlingContexts(townRoot string) []*beads.Issue {
-	var all []*beads.Issue
-	seen := make(map[string]bool)
-	for _, dir := range beadsSearchDirs(townRoot) {
-		b := beads.NewWithBeadsDir(dir, beads.ResolveBeadsDir(dir))
-		contexts, err := b.ListOpenSlingContexts()
-		if err != nil {
-			continue // Partial failure is acceptable — skip unavailable dirs
-		}
-		for _, ctx := range contexts {
-			if seen[ctx.ID] {
-				continue
-			}
-			seen[ctx.ID] = true
-			all = append(all, ctx)
-		}
+func listAllSlingContexts(townRoot string) ([]*beads.Issue, error) {
+	records, err := listAllSlingContextRecords(townRoot)
+	if err != nil {
+		return nil, err
 	}
-	return all
+	all := make([]*beads.Issue, 0, len(records))
+	for _, rec := range records {
+		all = append(all, rec.issue)
+	}
+	return all, nil
 }
 
-// listReadyWorkBeadIDsWithError returns a set of work bead IDs that are unblocked.
-// Returns an error only when ALL dirs fail (partial success is acceptable).
-func listReadyWorkBeadIDsWithError(townRoot string) (map[string]bool, error) {
-	readyIDs := make(map[string]bool)
-	dirs := beadsSearchDirs(townRoot)
+func listAllSlingContextRecords(townRoot string) ([]slingContextRecord, error) {
+	var records []slingContextRecord
+	seen := make(map[string]bool)
+	dirs, err := beadsSearchDirs(townRoot)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range dirs {
+		beadsDir := beads.ResolveBeadsDir(dir)
+		b := beads.NewWithBeadsDir(dir, beadsDir)
+		contexts, err := b.ListOpenSlingContexts()
+		if err != nil {
+			return nil, fmt.Errorf("listing sling contexts in %s: %w", beadsDir, err)
+		}
+		for _, ctx := range contexts {
+			key := beadsDir + "\x00" + ctx.ID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			records = append(records, slingContextRecord{issue: ctx, workDir: dir, beadsDir: beadsDir})
+		}
+	}
+	return records, nil
+}
+
+type blockedWorkQuery func(beadsDir string, groupedIDs []string) ([]byte, error)
+
+func runBlockedWorkQuery(beadsDir string, _ []string) ([]byte, error) {
+	// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
+	// and BEADS_DOLT_PORT translation.
+	b := beads.NewWithBeadsDir(filepath.Dir(beadsDir), beadsDir)
+	return b.Run("blocked", "--json")
+}
+
+func listBlockedWorkBeadIDStates(townRoot string, workBeadIDs []string) (map[string]bool, map[string]bool, error) {
+	return listBlockedWorkBeadIDStatesWithRunner(townRoot, workBeadIDs, runBlockedWorkQuery)
+}
+
+func listBlockedWorkBeadIDStatesWithRunner(townRoot string, workBeadIDs []string, query blockedWorkQuery) (map[string]bool, map[string]bool, error) {
+	blockedIDs := make(map[string]bool)
+	blockedUnknownIDs := make(map[string]bool)
+	idsByBeadsDir := groupBeadIDsByResolvedBeadsDir(townRoot, workBeadIDs)
 	failCount := 0
 	var lastErr error
-	for _, dir := range dirs {
-		// Use Beads wrapper to get proper BEADS_DIR resolution, --allow-stale,
-		// and BEADS_DOLT_PORT translation. Raw exec.Command missed these,
-		// causing the scheduler to query stale/wrong dolt databases and return
-		// empty readyWorkIDs. See GH#803.
-		b := beads.New(dir)
-		readyOut, err := b.Run("ready", "--json", "--limit=0")
+	for beadsDir, groupedIDs := range idsByBeadsDir {
+		blockedOut, err := query(beadsDir, groupedIDs)
 		if err != nil {
 			failCount++
 			lastErr = err
-			fmt.Fprintf(os.Stderr, "%s Warning: bd ready failed for %s: %v\n",
-				style.Dim.Render("⚠"), dir, err)
+			markBlockedUnknown(blockedUnknownIDs, groupedIDs)
+			fmt.Fprintf(os.Stderr, "%s Warning: bd blocked failed for %s: %v\n",
+				style.Dim.Render("⚠"), filepath.Dir(beadsDir), err)
 			continue
 		}
-		var readyBeads []struct {
+		var blockedBeads []struct {
 			ID string `json:"id"`
 		}
-		if err := json.Unmarshal(readyOut, &readyBeads); err == nil {
-			for _, b := range readyBeads {
-				readyIDs[b.ID] = true
-			}
+		if err := json.Unmarshal(blockedOut, &blockedBeads); err != nil {
+			failCount++
+			lastErr = err
+			markBlockedUnknown(blockedUnknownIDs, groupedIDs)
+			fmt.Fprintf(os.Stderr, "%s Warning: parsing bd blocked failed for %s: %v\n",
+				style.Dim.Render("⚠"), filepath.Dir(beadsDir), err)
+			continue
+		}
+		for _, b := range blockedBeads {
+			blockedIDs[b.ID] = true
 		}
 	}
-	if failCount == len(dirs) && failCount > 0 {
-		return nil, fmt.Errorf("all %d bd ready queries failed (last: %w)", failCount, lastErr)
+	if failCount == len(idsByBeadsDir) && failCount > 0 {
+		return blockedIDs, blockedUnknownIDs, fmt.Errorf("all %d bd blocked queries failed (last: %w)", failCount, lastErr)
 	}
-	return readyIDs, nil
+	return blockedIDs, blockedUnknownIDs, nil
 }
 
-// listReadyWorkBeadIDs returns a set of work bead IDs that are unblocked.
-// Convenience wrapper that ignores errors (used by listScheduledBeads for display).
-func listReadyWorkBeadIDs(townRoot string) map[string]bool {
-	ids, _ := listReadyWorkBeadIDsWithError(townRoot)
-	if ids == nil {
-		return make(map[string]bool)
+func markBlockedUnknown(blockedUnknownIDs map[string]bool, ids []string) {
+	for _, id := range ids {
+		if id != "" {
+			blockedUnknownIDs[id] = true
+		}
 	}
-	return ids
+}
+
+func isScheduledWorkBeadReady(workBeadID string, info beadStatusInfo, found bool, blockedWorkIDs, blockedUnknownIDs map[string]bool) bool {
+	if !found || blockedWorkIDs[workBeadID] || blockedUnknownIDs[workBeadID] {
+		return false
+	}
+	return info.Status == "open"
 }

@@ -1492,6 +1492,72 @@ func TestBuildStartupCommand_UsesRigAgentWhenRigPathProvided(t *testing.T) {
 	}
 }
 
+func TestBuildStartupCommand_ClearsBDTargetSelectors(t *testing.T) {
+	binDir := t.TempDir()
+	writeAgentStub(t, binDir, "agent")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "testrig")
+	townSettings := NewTownSettings()
+	townSettings.RoleAgents = map[string]string{constants.RoleWitness: "target-cleaner"}
+	townSettings.Agents["target-cleaner"] = &RuntimeConfig{
+		Command: "agent",
+		Env: map[string]string{
+			"BEADS_DIR":                  "/agent/beads",
+			"BEADS_DOLT_DATA_DIR":        "/agent/data",
+			"BEADS_DOLT_SERVER_DATABASE": "agentdb",
+			"BEADS_DOLT_SERVER_SOCKET":   "/agent/socket",
+			"GT_DOLT_DATA":               "/agent/data",
+			"GT_DOLT_PORT":               "1555",
+			"GT_DOLT_HOST":               "agent-host",
+			"BEADS_DOLT_PORT":            "1555",
+			"BEADS_DOLT_SERVER_PORT":     "1555",
+			"BEADS_DOLT_SERVER_HOST":     "agent-host",
+			"BEADS_DOLT_AUTO_START":      "0",
+		},
+	}
+	if err := SaveTownSettings(TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := SaveRigSettings(RigSettingsPath(rigPath), NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	cmd := BuildStartupCommand(map[string]string{
+		"GT_ROLE":                    constants.RoleWitness,
+		"BEADS_DIR":                  "/caller/beads",
+		"BEADS_DOLT_DATA_DIR":        "/caller/data",
+		"BEADS_DOLT_SERVER_DATABASE": "callerdb",
+		"GT_DOLT_DATA":               "/caller/data",
+		"GT_DOLT_PORT":               "1444",
+		"GT_DOLT_HOST":               "caller-host",
+	}, rigPath, "")
+
+	for _, key := range bdTargetSelectorEnvVars {
+		if !strings.Contains(cmd, key+"=") {
+			t.Fatalf("startup command missing cleared %s assignment: %q", key, cmd)
+		}
+	}
+	for _, stale := range []string{"/caller", "/agent", "callerdb", "agentdb"} {
+		if strings.Contains(cmd, stale) {
+			t.Fatalf("startup command leaked stale bd selector value %q: %q", stale, cmd)
+		}
+	}
+	for _, want := range []string{
+		"GT_DOLT_PORT=1555",
+		"GT_DOLT_HOST=agent-host",
+		"BEADS_DOLT_PORT=1555",
+		"BEADS_DOLT_SERVER_PORT=1555",
+		"BEADS_DOLT_SERVER_HOST=agent-host",
+		"BEADS_DOLT_AUTO_START=0",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("startup command missing preserved connection env %q: %q", want, cmd)
+		}
+	}
+}
+
 func TestBuildStartupCommand_UsesRoleAgentsFromTownSettings(t *testing.T) {
 	townRoot := t.TempDir()
 	rigPath := filepath.Join(townRoot, "testrig")
@@ -2962,7 +3028,7 @@ func TestFillRuntimeDefaults(t *testing.T) {
 			Provider:      "codex",
 			Command:       "opencode",
 			Args:          []string{"-m", "gpt-5"},
-			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`},
+			Env:           map[string]string{"OPENCODE_PERMISSION": `{"*":"allow"}`, "OPENCODE_CONFIG_CONTENT": `{"lsp":false}`},
 			InitialPrompt: "test prompt",
 			PromptMode:    "none",
 			ResolvedAgent: "opencode",
@@ -2993,6 +3059,9 @@ func TestFillRuntimeDefaults(t *testing.T) {
 		}
 		if result.Env["OPENCODE_PERMISSION"] != input.Env["OPENCODE_PERMISSION"] {
 			t.Errorf("Env: got %v, want %v", result.Env, input.Env)
+		}
+		if result.Env["OPENCODE_CONFIG_CONTENT"] != input.Env["OPENCODE_CONFIG_CONTENT"] {
+			t.Errorf("OPENCODE_CONFIG_CONTENT was not preserved: got %v, want %v", result.Env, input.Env)
 		}
 		if result.InitialPrompt != input.InitialPrompt {
 			t.Errorf("InitialPrompt: got %q, want %q", result.InitialPrompt, input.InitialPrompt)
@@ -3582,6 +3651,9 @@ func TestLookupAgentConfigPreservesCustomFields(t *testing.T) {
 	if rc.Env["OPENCODE_PERMISSION"] != `{"*":"allow"}` {
 		t.Errorf("Env was not preserved: got %v", rc.Env)
 	}
+	if rc.Env["OPENCODE_CONFIG_CONTENT"] != `{"lsp":true}` {
+		t.Errorf("OpenCode LSP default missing: got %v", rc.Env)
+	}
 	if rc.Tmux == nil || len(rc.Tmux.ProcessNames) != 2 {
 		t.Errorf("Tmux.ProcessNames not preserved: got %+v", rc.Tmux)
 	}
@@ -3676,6 +3748,76 @@ func TestBuildCommandWithPromptNoWarnOnEmptyPrompt(t *testing.T) {
 	}
 }
 
+func TestCodexBuildCommandWithPromptIncludesBootstrapPrompt(t *testing.T) {
+	rc := RuntimeConfigFromPreset(AgentCodex)
+
+	var cmd string
+	stderr := captureStderr(t, func() {
+		cmd = rc.BuildCommandWithPrompt("bootstrap now")
+	})
+
+	if stderr != "" {
+		t.Errorf("no warning expected for codex prompt delivery, got: %q", stderr)
+	}
+	if !strings.Contains(cmd, "bootstrap now") {
+		t.Errorf("codex startup command should include bootstrap prompt, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, codexUpdateCheckConfig) {
+		t.Errorf("codex startup command should suppress update checks, got: %s", cmd)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexCustomArgsSuppressesUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile", "fast"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if !strings.Contains(args, codexUpdateCheckConfig) {
+		t.Fatalf("codex custom args missing update suppression: %v", rc.Args)
+	}
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("codex update suppression duplicated: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexDoesNotOverrideExplicitUpdateCheck(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"-c", "check_for_update_on_startup=true"},
+	})
+
+	args := strings.Join(rc.Args, " ")
+	if strings.Count(args, "check_for_update_on_startup") != 1 {
+		t.Fatalf("explicit codex update config should not be duplicated: %v", rc.Args)
+	}
+	if !strings.Contains(args, "check_for_update_on_startup=true") {
+		t.Fatalf("explicit codex update config should be preserved: %v", rc.Args)
+	}
+}
+
+func TestFillRuntimeDefaultsCodexIgnoresUnrelatedUpdateCheckSubstring(t *testing.T) {
+	rc := fillRuntimeDefaults(&RuntimeConfig{
+		Provider: "codex",
+		Command:  "codex",
+		Args:     []string{"--profile=check_for_update_on_startup-note"},
+	})
+
+	found := false
+	for _, arg := range rc.Args {
+		if arg == codexUpdateCheckConfig {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("codex update suppression should be injected despite unrelated substring: %v", rc.Args)
+	}
+}
+
 // TestBuildArgsWithPromptWarnsOnDroppedPrompt verifies the parallel warning in
 // BuildArgsWithPrompt when PromptMode is "none" and a non-empty prompt is provided.
 func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
@@ -3718,7 +3860,7 @@ func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
 //	      "command": "opencode",
 //	      "args": ["-m", "openai/gpt-5.2-codex"],
 //	      "prompt_mode": "none",
-//	      "process_names": ["opencode", "node"],
+//	      "process_names": ["opencode", "node", "bun"],
 //	      "env": {
 //	        "OPENCODE_PERMISSION": "{\"*\":\"allow\"}"
 //	      }
@@ -3735,11 +3877,11 @@ func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
 //	}
 //
 // Manual test procedure:
-//  1. Set role_agents.mayor to each agent (claude, gemini, codex, cursor, auggie, amp, opencode)
+//  1. Set role_agents.mayor to each agent (claude, gemini, codex, kiro, cursor, auggie, amp, opencode)
 //  2. Run: gt start
 //  3. Verify mayor starts with correct agent config
 //  4. Run: GT_NUKE_ACKNOWLEDGED=1 gt down --nuke
-//  5. Repeat for all 7 built-in agents
+//  5. Repeat for all built-in agents
 func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
 	skipIfAgentBinaryMissing(t, "opencode", "claude")
 	t.Parallel()
@@ -3830,7 +3972,7 @@ func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
 }
 
 // TestMultipleAgentTypes tests that various built-in agent presets work correctly.
-// NOTE: Only these are actual built-in presets: claude, gemini, codex, cursor, auggie, amp, opencode.
+// NOTE: Only these are actual built-in presets: claude, gemini, codex, kiro, cursor, auggie, amp, opencode.
 // Variants like "claude-opus", "claude-haiku", "claude-sonnet" are NOT built-in - they need
 // to be defined as custom agents in TownSettings.Agents if specific model selection is needed.
 func TestMultipleAgentTypes(t *testing.T) {

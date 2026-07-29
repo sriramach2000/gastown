@@ -176,16 +176,13 @@ func (m *SessionManager) clonePath(polecat string) string {
 
 // freshBranchName returns a unique branch name for a new polecat session.
 // Mirrors the naming convention in Manager.buildBranchName:
-//   - polecat/<name>/<issue>@<timestamp> when an issue is known
+//   - polecat/<name>/<issue>+<timestamp> when an issue is known
 //   - polecat/<name>-<timestamp> otherwise
 //
 // parseFreshBranchName is the structural inverse.
 func (m *SessionManager) freshBranchName(polecatName, issue string) string {
 	ts := strconv.FormatInt(time.Now().UnixMilli(), 36)
-	if issue != "" {
-		return fmt.Sprintf("polecat/%s/%s@%s", polecatName, issue, ts)
-	}
-	return fmt.Sprintf("polecat/%s-%s", polecatName, ts)
+	return FormatGeneratedBranchName(polecatName, issue, ts)
 }
 
 // freshBranchMeta holds the identity decoded from a branch produced by
@@ -201,30 +198,11 @@ type freshBranchMeta struct {
 // the formatter emits. Used in place of substring heuristics so that
 // branch-naming changes can be made in a single place.
 func parseFreshBranchName(branch string) freshBranchMeta {
-	const prefix = "polecat/"
-	if !strings.HasPrefix(branch, prefix) {
+	meta, ok := ParseGeneratedBranchName(branch)
+	if !ok {
 		return freshBranchMeta{}
 	}
-	rest := branch[len(prefix):]
-	if slash := strings.Index(rest, "/"); slash >= 0 {
-		// polecat/<name>/<issue>@<ts>
-		if slash == 0 {
-			return freshBranchMeta{}
-		}
-		name := rest[:slash]
-		tail := rest[slash+1:]
-		at := strings.LastIndex(tail, "@")
-		if at <= 0 || at == len(tail)-1 {
-			return freshBranchMeta{}
-		}
-		return freshBranchMeta{polecat: name, issue: tail[:at], ok: true}
-	}
-	// polecat/<name>-<ts> (no slash in rest)
-	dash := strings.LastIndex(rest, "-")
-	if dash <= 0 || dash == len(rest)-1 {
-		return freshBranchMeta{}
-	}
-	return freshBranchMeta{polecat: rest[:dash], ok: true}
+	return freshBranchMeta{polecat: meta.Polecat, issue: meta.Issue, ok: true}
 }
 
 func (m *SessionManager) canonicalSessionStartPoint(g *git.Git) string {
@@ -532,11 +510,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Accept startup dialogs (workspace trust + bypass permissions) if they appear
 	debugSession("AcceptStartupDialogs", m.tmux.AcceptStartupDialogs(sessionID))
+	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("startup blocked: %w", err)
+	}
 
 	// Wait for runtime to be fully ready at the prompt (not just started).
 	// Uses prompt-based polling for agents with ReadyPromptPrefix (e.g., Claude "❯ "),
 	// falling back to ReadyDelayMs sleep for agents without prompt detection.
 	debugSession("WaitForRuntimeReady", m.tmux.WaitForRuntimeReady(sessionID, runtimeConfig, constants.ClaudeStartTimeout))
+	if err := m.tmux.CheckStartupBlocked(sessionID); err != nil {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("startup blocked: %w", err)
+	}
 
 	// Handle fallback nudges for non-hook agents.
 	// See StartupFallbackInfo in runtime package for the fallback matrix.
@@ -593,6 +579,10 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 	if !running {
 		return fmt.Errorf("session %s died during startup (agent command may have failed)", sessionID)
+	}
+	if status := m.tmux.CheckSessionHealth(sessionID, 0); status != tmux.SessionHealthy {
+		_ = m.tmux.KillSessionWithProcesses(sessionID)
+		return fmt.Errorf("session %s unhealthy during startup: %s", sessionID, status)
 	}
 
 	// Validate GT_AGENT is set. Without GT_AGENT, IsAgentAlive falls back to

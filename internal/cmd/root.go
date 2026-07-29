@@ -116,6 +116,13 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Initialize CLI theme (dark/light mode support)
 	initCLITheme()
 
+	// gt done can autosave and push; prove ownership before shared pre-run writes.
+	if isDoneCommand(cmd) {
+		if _, err := resolveDonePolecatWorktree(); err != nil {
+			return err
+		}
+	}
+
 	// Log command usage telemetry (fire-and-forget, excludes tap/signal)
 	logCommandUsage(cmd, args)
 
@@ -178,6 +185,15 @@ func isCommandOrAncestorExempt(cmd *cobra.Command, exemptions map[string]bool) b
 func isRoleCommand(cmd *cobra.Command) bool {
 	for c := cmd; c != nil; c = c.Parent() {
 		if c.Name() == "role" {
+			return true
+		}
+	}
+	return false
+}
+
+func isDoneCommand(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == "done" {
 			return true
 		}
 	}
@@ -291,34 +307,35 @@ func checkStaleBinaryWarning() {
 		staleBinaryWarned = true
 		_ = os.Setenv("GT_STALE_WARNED", "1")
 
-		msg := fmt.Sprintf("gt binary is stale (built from %s, repo at %s)",
-			version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		if info.CommitsBehind > 0 {
-			msg = fmt.Sprintf("gt binary is %d commits behind (built from %s, repo at %s)",
-				info.CommitsBehind, version.ShortCommit(info.BinaryCommit), version.ShortCommit(info.RepoCommit))
-		}
+		msg := info.Describe("gt binary")
 		fmt.Fprintf(os.Stderr, "%s %s\n", style.WarningPrefix, msg)
-		fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		if info.IsForward && info.OnMainBranch {
+			fmt.Fprintf(os.Stderr, "    %s Run 'make install' in gastown repo to update\n", style.ArrowPrefix)
+		} else {
+			fmt.Fprintf(os.Stderr, "    %s Run 'gt stale' for details; switch to a build branch before rebuilding\n", style.ArrowPrefix)
+		}
 	}
 }
 
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
-	ctx := context.Background()
-	provider, err := telemetry.Init(ctx, "gastown", Version)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: telemetry init: %v\n", err)
-	}
-	if provider != nil {
-		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = provider.Shutdown(shutdownCtx)
-		}()
-		// Set OTEL_RESOURCE_ATTRIBUTES in the process env so all bd subprocesses
-		// spawned via exec.Command inherit GT context automatically.
-		telemetry.SetProcessOTELAttrs()
+	if !isDoneInvocation(os.Args[1:]) {
+		ctx := context.Background()
+		provider, err := telemetry.Init(ctx, "gastown", Version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: telemetry init: %v\n", err)
+		}
+		if provider != nil {
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = provider.Shutdown(shutdownCtx)
+			}()
+			// Set OTEL_RESOURCE_ATTRIBUTES in the process env so all bd subprocesses
+			// spawned via exec.Command inherit GT context automatically.
+			telemetry.SetProcessOTELAttrs()
+		}
 	}
 
 	if err := rootCmd.Execute(); err != nil {
@@ -330,6 +347,11 @@ func Execute() int {
 		return 1
 	}
 	return 0
+}
+
+func isDoneInvocation(args []string) bool {
+	cmd, _, err := rootCmd.Find(args)
+	return err == nil && isDoneCommand(cmd)
 }
 
 // Command group IDs - used by subcommands to organize help output

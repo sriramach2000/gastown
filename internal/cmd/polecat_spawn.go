@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,6 +21,8 @@ import (
 	"github.com/steveyegge/gastown/internal/witness"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
+
+const minPolecatDirsPerRig = 30
 
 // SpawnedPolecatInfo contains info about a spawned polecat session.
 type SpawnedPolecatInfo struct {
@@ -50,13 +51,49 @@ func (s *SpawnedPolecatInfo) SessionStarted() bool {
 
 // SlingSpawnOptions contains options for spawning a polecat via sling.
 type SlingSpawnOptions struct {
-	Force        bool   // Force spawn even if polecat has uncommitted work
-	Account      string // Claude Code account handle to use
-	Create       bool   // Create polecat if it doesn't exist (currently always true for sling)
-	HookBead     string // Bead ID to set as hook_bead at spawn time (atomic assignment)
-	Agent        string // Agent override for this spawn (e.g., "gemini", "codex", "claude-haiku")
-	BaseBranch   string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
-	ResumeBranch string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>@<ts>
+	TownRoot      string // Gas Town workspace root; falls back to cwd when empty
+	Force         bool   // Force spawn even if polecat has uncommitted work
+	Account       string // Claude Code account handle to use
+	Create        bool   // Create polecat if it doesn't exist (currently always true for sling)
+	HookBead      string // Bead ID to set as hook_bead at spawn time (atomic assignment)
+	Agent         string // Agent override for this spawn (e.g., "gemini", "codex", "claude-haiku")
+	BaseBranch    string // Override base branch for polecat worktree (e.g., "develop", "release/v2")
+	ResumeBranch  string // Resume an existing branch (e.g. PR head) instead of creating polecat/<name>/<bead>+<ts>
+	SkipAdmission bool   // Caller already holds a polecat admission reservation
+}
+
+func effectivePolecatDirCap(configured int) int {
+	if configured < minPolecatDirsPerRig {
+		return minPolecatDirsPerRig
+	}
+	return configured
+}
+
+func reclaimBrokenIdlePolecatForSling(polecatMgr *polecat.Manager) (bool, error) {
+	polecats, err := polecatMgr.List()
+	if err != nil {
+		return false, err
+	}
+
+	for _, candidate := range polecats {
+		if candidate == nil || candidate.State != polecat.StateIdle || candidate.Issue != "" {
+			continue
+		}
+		verifyErr := verifyWorktreeExists(candidate.ClonePath)
+		if verifyErr == nil || !polecat.IsStructuralWorktreeError(verifyErr) {
+			continue
+		}
+
+		fmt.Printf("  Reclaiming broken idle polecat %s before allocation: %v\n", candidate.Name, verifyErr)
+		if err := polecatMgr.ReclaimBrokenIdlePolecat(candidate.Name); err != nil {
+			fmt.Printf("  Broken idle polecat %s was not safe to reclaim: %v\n", candidate.Name, err)
+			continue
+		}
+		fmt.Printf("  %s Broken idle polecat %s reclaimed before assigning new work\n", style.Bold.Render("✓"), candidate.Name)
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // SpawnPolecatForSling creates a fresh polecat and optionally starts its session.
@@ -64,9 +101,13 @@ type SlingSpawnOptions struct {
 // The caller (sling) handles hook attachment and nudging.
 func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
 	// Find workspace
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+	townRoot := opts.TownRoot
+	if townRoot == "" {
+		var err error
+		townRoot, err = workspace.FindFromCwdOrError()
+		if err != nil {
+			return nil, fmt.Errorf("not in a Gas Town workspace: %w", err)
+		}
 	}
 
 	// Load rig config
@@ -100,19 +141,21 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 		return nil, fmt.Errorf("admission control: %w", err)
 	}
 
-	// Polecat count cap (clown show #22): refuse to spawn if there are already
-	// too many working polecats. This is a last-resort safety net for the direct-dispatch
-	// path. For configurable capacity gating, use scheduler.max_polecats in town settings
-	// (see internal/scheduler/capacity/).
-	// Uses countWorkingPolecats to exclude idle polecats (completed work, no hook bead)
-	// that are available for re-sling under the persistent polecat model.
-	const defaultMaxActivePolecats = 25
-	workingCount := countWorkingPolecats()
-	if workingCount >= defaultMaxActivePolecats {
-		return nil, fmt.Errorf("polecat cap reached: %d working polecats (max %d). "+
-			"This is a safety limit to prevent spawn storms. "+
-			"Investigate why polecats are accumulating before spawning more",
-			workingCount, defaultMaxActivePolecats)
+	if blocked, reason := IsRigParkedOrDocked(townRoot, rigName); blocked {
+		undoCmd := "gt rig unpark"
+		if reason == "docked" {
+			undoCmd = "gt rig undock"
+		}
+		return nil, fmt.Errorf("cannot sling to %s rig %q\n%s %s", reason, rigName, undoCmd, rigName)
+	}
+
+	var admission *polecatAdmissionHandle
+	if !opts.SkipAdmission {
+		admission, _, err = acquirePolecatAdmissionFn(townRoot, rigName, opts.HookBead, "spawn-or-reuse")
+		if err != nil {
+			return nil, err
+		}
+		defer admission.Release()
 	}
 
 	// Per-bead respawn circuit breaker (clown show #22):
@@ -129,6 +172,12 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 				opts.HookBead, rigName, opts.HookBead)
 		}
 		witness.RecordBeadRespawn(townRoot, opts.HookBead)
+	}
+
+	if reclaimed, err := reclaimBrokenIdlePolecatForSling(polecatMgr); err != nil {
+		style.PrintWarning("could not reclaim broken idle polecat before allocation: %v", err)
+	} else if reclaimed {
+		fmt.Println("  Allocating fresh polecat after reclaiming broken idle sandbox...")
 	}
 
 	// Persistent polecat model (gt-4ac): try to reuse an idle polecat first.
@@ -231,7 +280,7 @@ func SpawnPolecatForSling(rigName string, opts SlingSpawnOptions) (*SpawnedPolec
 	// Per-rig directory cap: prevent unbounded worktree accumulation, but only
 	// after trying safe reuse. A reusable preserved polecat should not be blocked
 	// just because the rig is already at the directory cap.
-	const maxPolecatDirsPerRig = 30
+	maxPolecatDirsPerRig := effectivePolecatDirCap(r.GetIntConfig("max_polecats"))
 	rigPolecatDir := filepath.Join(townRoot, rigName, "polecats")
 	if entries, err := os.ReadDir(rigPolecatDir); err == nil {
 		dirCount := 0
@@ -527,49 +576,5 @@ func ensurePolecatVenv(clonePath string) error {
 // and that it is a functional git repository. Returns an error if the worktree is missing,
 // has a broken .git reference, or fails basic git validation. (GH#2056)
 func verifyWorktreeExists(clonePath string) error {
-	// Check if directory exists
-	info, err := os.Stat(clonePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("worktree directory does not exist: %s", clonePath)
-		}
-		return fmt.Errorf("checking worktree directory: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("worktree path is not a directory: %s", clonePath)
-	}
-
-	// Check for .git file (worktrees have a .git file, not a .git directory)
-	gitPath := filepath.Join(clonePath, ".git")
-	if _, err := os.Stat(gitPath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("worktree missing .git file (not a valid git worktree): %s", clonePath)
-		}
-		return fmt.Errorf("checking .git: %w", err)
-	}
-
-	// For worktree .git files, verify the gitdir reference points to a valid path.
-	// A broken reference (e.g., from os.Rename instead of git worktree move) causes
-	// "fatal: not a git repository" for every git operation.
-	gitContent, err := os.ReadFile(gitPath)
-	if err == nil {
-		content := strings.TrimSpace(string(gitContent))
-		if strings.HasPrefix(content, "gitdir: ") {
-			gitdirPath := strings.TrimPrefix(content, "gitdir: ")
-			if !filepath.IsAbs(gitdirPath) {
-				gitdirPath = filepath.Join(clonePath, gitdirPath)
-			}
-			if _, err := os.Stat(gitdirPath); err != nil {
-				return fmt.Errorf("worktree .git references nonexistent gitdir %s: %w", gitdirPath, err)
-			}
-		}
-	}
-
-	// Final validation: run git rev-parse to confirm the worktree is functional
-	cmd := exec.Command("git", "-C", clonePath, "rev-parse", "--git-dir")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("worktree at %s is not a valid git repository: %s", clonePath, strings.TrimSpace(string(output)))
-	}
-
-	return nil
+	return polecat.VerifyWorktreeExists(clonePath)
 }

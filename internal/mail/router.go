@@ -363,6 +363,12 @@ func agentBeadToAddress(bead *agentBead) string {
 	}
 
 	id := bead.ID
+	if addr := dogAddressFromAgentBeadID(id); addr != "" {
+		return addr
+	}
+	if isDogAgentBeadIDWithoutName(id) {
+		return ""
+	}
 
 	// Handle hq- prefixed IDs (town-level format)
 	if strings.HasPrefix(id, "hq-") {
@@ -414,11 +420,7 @@ func agentBeadToAddress(bead *agentBead) string {
 			return rig + "/"
 		case "dog":
 			// Town-level named: gt-dog-alpha
-			if i+1 < len(parts) {
-				name := strings.Join(parts[i+1:], "-")
-				return "dog/" + name
-			}
-			return "dog/"
+			return dogAddressFromParts(parts, i)
 		}
 	}
 
@@ -938,6 +940,9 @@ func (r *Router) validateRecipient(identity string) error {
 	case "mayor", "mayor/", "deacon", "deacon/":
 		return nil
 	}
+	if _, ok := DogAddressName(identity); !ok && isReservedTownSubpath(identity) {
+		return fmt.Errorf("no agent found")
+	}
 
 	// Well-known rig-level singletons (rig/witness, rig/refinery) always
 	// valid — these agents are ephemeral and may not have an active session,
@@ -1005,6 +1010,10 @@ func (r *Router) validateRecipient(identity string) error {
 // validateAgentWorkspace checks if an agent's workspace directory exists on disk.
 // Used as a fallback when the agent isn't found in the bead registry.
 func (r *Router) validateAgentWorkspace(identity string) bool {
+	if _, ok := DogAddressName(identity); !ok && isReservedTownSubpath(identity) {
+		return false
+	}
+
 	parts := strings.Split(identity, "/")
 
 	switch len(parts) {
@@ -1030,7 +1039,7 @@ func (r *Router) validateAgentWorkspace(identity string) bool {
 			return dirExists(filepath.Join(r.townRoot, parts[0], parts[1], parts[2]))
 		}
 		// Dog addresses: deacon/dogs/<name>
-		if dirExists(filepath.Join(r.townRoot, parts[0], parts[1], parts[2])) {
+		if _, ok := DogAddressName(identity); ok && dirExists(filepath.Join(r.townRoot, parts[0], parts[1], parts[2])) {
 			return true
 		}
 	}
@@ -1595,13 +1604,6 @@ func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 // Supports mayor/, deacon/, rig/crew/name, rig/polecats/name, and rig/name addresses.
 // Respects agent DND/muted state - skips notification if recipient has DND enabled.
 func (r *Router) notifyRecipient(msg *Message) error {
-	// Check DND status before attempting notification
-	if r.townRoot != "" {
-		if r.isRecipientMuted(msg.To) {
-			return nil // Recipient has DND enabled, skip notification
-		}
-	}
-
 	sessionIDs := AddressToSessionIDs(msg.To)
 	if len(sessionIDs) == 0 {
 		return nil // Unable to determine session ID
@@ -1612,23 +1614,43 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		timeout = DefaultIdleNotifyTimeout
 	}
 
-	// Try each possible session ID until we find one that exists.
-	// This handles the ambiguity where canonical addresses (rig/name) don't
-	// distinguish between crew workers (gt-rig-crew-name) and polecats (gt-rig-name).
+	notification := formatNotificationMessage(msg)
+	priority := nudgePriorityForMailPriority(msg.Priority)
+	notified := 0
+	var errs []string
+	noTmuxServer := false
+
+	// Try every possible session ID. Canonical aliases (rig/name) can map to both
+	// crew and polecat sessions, and stopping after the first active session makes
+	// mail disappear for the other active alias owner.
 	for _, sessionID := range sessionIDs {
+		if r.isSessionMuted(sessionID) {
+			continue
+		}
+
 		hasSession, err := r.tmux.HasSession(sessionID)
-		if err != nil || !hasSession {
+		if errors.Is(err, tmux.ErrNoServer) {
+			noTmuxServer = true
+			break
+		}
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+			continue
+		}
+		if !hasSession {
 			continue
 		}
 
 		// Overseer is a human operator - use a visible banner instead of NudgeSession
 		// (which types into Claude's input and would disrupt the human's terminal).
 		if msg.To == "overseer" {
-			return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
+			if err := r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
+			}
+			notified++
+			continue
 		}
-
-		notification := formatNotificationMessage(msg)
-		priority := nudgePriorityForMailPriority(msg.Priority)
 
 		// Wait-idle-first delivery: try direct nudge if the agent is idle,
 		// fall back to cooperative queue if busy. WaitForIdle requires 2
@@ -1640,16 +1662,22 @@ func (r *Router) notifyRecipient(msg *Message) error {
 			// Agent is idle — deliver directly for immediate wakeup.
 			if err := r.tmux.NudgeSession(sessionID, notification); err == nil {
 				r.enqueueReplyReminder(msg, sessionID)
-				return nil
+				notified++
+				continue
 			} else if errors.Is(err, tmux.ErrSessionNotFound) {
 				continue
 			} else if errors.Is(err, tmux.ErrNoServer) {
-				return nil
+				noTmuxServer = true
+				break
+			} else {
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
 			}
 		} else if errors.Is(waitErr, tmux.ErrSessionNotFound) {
 			continue
 		} else if errors.Is(waitErr, tmux.ErrNoServer) {
-			return nil
+			noTmuxServer = true
+			break
 		} else if r.townRoot != "" {
 			// Timeout (agent busy) — queue for cooperative delivery
 			// at the next turn boundary.
@@ -1661,33 +1689,71 @@ func (r *Router) notifyRecipient(msg *Message) error {
 				ThreadID: msg.ThreadID,
 				Severity: prioritySeverityLabel(msg.Priority),
 			}); err != nil {
-				return err
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
 			}
 			r.enqueueReplyReminder(msg, sessionID)
-			return nil
+			notified++
+			continue
 		}
 		// No town root available — last resort direct delivery.
 		err = r.tmux.NudgeSession(sessionID, notification)
 		if err == nil {
 			r.enqueueReplyReminder(msg, sessionID)
+			notified++
+			continue
 		}
-		return err
+		if errors.Is(err, tmux.ErrNoServer) {
+			noTmuxServer = true
+			break
+		}
+		errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
 	}
-	// No tmux session found - enqueue nudge for ACP/propeller delivery
-	// This handles headless ACP mode where there's no tmux session
-	if r.townRoot != "" && len(sessionIDs) > 0 {
-		notification := formatNotificationMessage(msg)
-		return nudge.Enqueue(r.townRoot, sessionIDs[0], nudge.QueuedNudge{
-			Sender:   msg.From,
-			Message:  notification,
-			Priority: nudgePriorityForMailPriority(msg.Priority),
-			Kind:     nudgeKindForMessage(msg),
-			ThreadID: msg.ThreadID,
-			Severity: prioritySeverityLabel(msg.Priority),
-		})
+
+	if notified == 0 && r.townRoot != "" && (noTmuxServer || len(errs) == 0) {
+		// No tmux session found - enqueue for ACP/propeller delivery. For
+		// ambiguous aliases, queue every candidate rather than silently choosing
+		// the first session ID.
+		for _, sessionID := range sessionIDs {
+			if r.isSessionMuted(sessionID) {
+				continue
+			}
+			if err := nudge.Enqueue(r.townRoot, sessionID, nudge.QueuedNudge{
+				Sender:   msg.From,
+				Message:  notification,
+				Priority: priority,
+				Kind:     nudgeKindForMessage(msg),
+				ThreadID: msg.ThreadID,
+				Severity: prioritySeverityLabel(msg.Priority),
+			}); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", sessionID, err))
+				continue
+			}
+			notified++
+		}
+	}
+
+	if len(errs) > 0 {
+		if notified > 0 {
+			fmt.Fprintf(os.Stderr, "Warning: mail notification partially failed: %s\n", strings.Join(errs, "; "))
+			return nil
+		}
+		return fmt.Errorf("mail notification failed: %s", strings.Join(errs, "; "))
 	}
 
 	return nil // No active session found
+}
+
+func (r *Router) isSessionMuted(sessionID string) bool {
+	if r.townRoot == "" || sessionID == "" || sessionID == session.OverseerSessionName() {
+		return false
+	}
+	bd := beads.New(r.townRoot)
+	level, err := bd.GetAgentNotificationLevel(sessionID)
+	if err != nil {
+		return false
+	}
+	return level == beads.NotifyMuted
 }
 
 func nudgeKindForMessage(msg *Message) string {
@@ -1732,6 +1798,7 @@ func prioritySeverityLabel(priority Priority) string {
 // Skipped when:
 //   - No town root (can't use nudge queue)
 //   - Message type is TypeReply (recipient is already replying)
+//   - Sender is not a direct mail address that can receive a reply
 //   - Configured delay is zero or negative (feature disabled)
 func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if r.townRoot == "" {
@@ -1739,6 +1806,9 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	}
 	if msg.Type == TypeReply {
 		return // Already a reply — reminder would be redundant
+	}
+	if !senderCanReceiveReply(msg.From) {
+		return
 	}
 	delay := config.LoadOperationalConfig(r.townRoot).GetMailConfig().ReplyReminderDelayD()
 	if delay <= 0 {
@@ -1755,6 +1825,46 @@ func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if err := nudge.Enqueue(r.townRoot, sessionID, reminder); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to enqueue reply reminder for %s: %v\n", sessionID, err)
 	}
+}
+
+func senderCanReceiveReply(from string) bool {
+	if from == "" || strings.TrimSpace(from) != from || strings.ContainsAny(from, " \t\r\n") {
+		return false
+	}
+
+	identity := AddressToIdentity(from)
+	switch identity {
+	case "overseer", "mayor/", "deacon/":
+		return true
+	}
+	if identity == "" || strings.HasPrefix(identity, "@") || strings.ContainsAny(identity, ":@") {
+		return false
+	}
+
+	parts := strings.Split(identity, "/")
+	switch len(parts) {
+	case 2:
+		if !validReplyAddressPart(parts[0]) || !validReplyAddressPart(parts[1]) {
+			return false
+		}
+		if parts[0] == constants.RoleMayor || parts[0] == constants.RoleDeacon {
+			return false
+		}
+		switch parts[1] {
+		case constants.RoleCrew, "polecat", "polecats", "dogs":
+			return false
+		default:
+			return true
+		}
+	case 3:
+		return parts[0] == constants.RoleDeacon && parts[1] == "dogs" && validReplyAddressPart(parts[2])
+	default:
+		return false
+	}
+}
+
+func validReplyAddressPart(part string) bool {
+	return part != "" && strings.TrimSpace(part) == part && !strings.ContainsAny(part, " \t\r\n:@")
 }
 
 // ClearReplyReminders removes any queued reply-reminder nudges for the given
@@ -1805,13 +1915,20 @@ func (r *Router) isRecipientMuted(address string) bool {
 // addressToAgentBeadID converts a mail address to an agent bead ID for DND lookup.
 // Returns empty string if the address cannot be converted.
 func addressToAgentBeadID(address string) string {
-	switch {
-	case address == "overseer":
+	if address == "overseer" {
 		return "" // Overseer is a human, no agent bead
-	case strings.HasPrefix(address, constants.RoleMayor):
+	}
+	if dogName, ok := DogAddressName(address); ok {
+		return session.DogSessionName(dogName)
+	}
+	switch address {
+	case constants.RoleMayor, constants.RoleMayor + "/":
 		return session.MayorSessionName()
-	case strings.HasPrefix(address, constants.RoleDeacon):
+	case constants.RoleDeacon, constants.RoleDeacon + "/":
 		return session.DeaconSessionName()
+	}
+	if isReservedTownSubpath(address) {
+		return ""
 	}
 
 	parts := strings.SplitN(address, "/", 2)
@@ -1832,6 +1949,9 @@ func addressToAgentBeadID(address string) string {
 	case strings.HasPrefix(target, "crew/"):
 		crewName := strings.TrimPrefix(target, "crew/")
 		return session.CrewSessionName(rigPrefix, crewName)
+	case strings.HasPrefix(target, "polecat/"):
+		pcName := strings.TrimPrefix(target, "polecat/")
+		return session.PolecatSessionName(rigPrefix, pcName)
 	case strings.HasPrefix(target, "polecats/"):
 		pcName := strings.TrimPrefix(target, "polecats/")
 		return session.PolecatSessionName(rigPrefix, pcName)
@@ -1852,15 +1972,21 @@ func AddressToSessionIDs(address string) []string {
 	if address == "overseer" {
 		return []string{session.OverseerSessionName()}
 	}
+	if dogName, ok := DogAddressName(address); ok {
+		return []string{session.DogSessionName(dogName)}
+	}
 
 	// Mayor address: "mayor/" or "mayor"
-	if strings.HasPrefix(address, constants.RoleMayor) {
+	if address == constants.RoleMayor || address == constants.RoleMayor+"/" {
 		return []string{session.MayorSessionName()}
 	}
 
 	// Deacon address: "deacon/" or "deacon"
-	if strings.HasPrefix(address, constants.RoleDeacon) {
+	if address == constants.RoleDeacon || address == constants.RoleDeacon+"/" {
 		return []string{session.DeaconSessionName()}
+	}
+	if isReservedTownSubpath(address) {
+		return nil
 	}
 
 	// Rig-based address: "rig/target" or "rig/crew/name" or "rig/polecats/name"
@@ -1873,11 +1999,15 @@ func AddressToSessionIDs(address string) []string {
 	target := parts[1]
 	rigPrefix := session.PrefixFor(rig)
 
-	// If target already has crew/ or polecats/ prefix, use it directly
+	// If target already has crew/, polecat/, or polecats/ prefix, use it directly
 	// e.g., "gastown/crew/holden" → "gt-crew-holden"
 	if strings.HasPrefix(target, "crew/") {
 		crewName := strings.TrimPrefix(target, "crew/")
 		return []string{session.CrewSessionName(rigPrefix, crewName)}
+	}
+	if strings.HasPrefix(target, "polecat/") {
+		polecatName := strings.TrimPrefix(target, "polecat/")
+		return []string{session.PolecatSessionName(rigPrefix, polecatName)}
 	}
 	if strings.HasPrefix(target, "polecats/") {
 		polecatName := strings.TrimPrefix(target, "polecats/")

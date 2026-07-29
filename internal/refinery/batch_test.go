@@ -94,6 +94,7 @@ func newTestEngineer(t *testing.T, workDir string, g *gitpkg.Git) *Engineer {
 	e.git = g
 	e.workDir = workDir
 	e.output = &bytes.Buffer{}
+	e.testAllowSyntheticMRs = true
 	// No-op merge slot functions for tests
 	e.mergeSlotEnsureExists = func() (string, error) { return "test-slot", nil }
 	e.mergeSlotAcquire = func(holder string, addWaiter bool) (*beads.MergeSlotStatus, error) {
@@ -131,6 +132,24 @@ func TestDefaultBatchConfig(t *testing.T) {
 	if !cfg.RetryBatchOnFlaky {
 		t.Error("expected RetryBatchOnFlaky true")
 	}
+}
+
+func TestFastForwardBatch_BlocksForkBackedDefaultPush(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+	addDistinctUpstreamRemote(t, workDir, g)
+	e := newTestEngineer(t, workDir, g)
+	before := run(t, workDir, "git", "rev-parse", "origin/main")
+
+	writeFile(t, workDir, "batched.txt", "batched\n")
+	run(t, workDir, "git", "add", ".")
+	run(t, workDir, "git", "commit", "-m", "batch result")
+
+	result := e.fastForwardBatch(context.Background(), nil, "main", &BatchResult{})
+	if result.Error == nil || !strings.Contains(result.Error.Error(), "refusing direct push") {
+		t.Fatalf("expected fork-backed default push refusal, got: %+v", result)
+	}
+	assertOriginMainUnchangedAndReset(t, workDir, before)
 }
 
 // --- AssembleBatch tests ---
@@ -357,6 +376,36 @@ func TestBuildRebaseStack_MissingBranch(t *testing.T) {
 	}
 	if len(conflicts) != 1 || conflicts[0].ID != "mr-missing" {
 		t.Errorf("expected mr-missing in conflicts, got %v", stackedIDs(conflicts))
+	}
+}
+
+func TestBuildRebaseStack_RejectsAdvancedSourceBranch(t *testing.T) {
+	workDir, g, cleanup := testGitRepo(t)
+	defer cleanup()
+
+	branch := "feature-advanced"
+	createFeatureBranch(t, workDir, branch, "a.txt", "submitted\n")
+	commit := run(t, workDir, "git", "rev-parse", branch)
+	run(t, workDir, "git", "checkout", branch)
+	writeFile(t, workDir, "later.txt", "not submitted\n")
+	run(t, workDir, "git", "add", ".")
+	run(t, workDir, "git", "commit", "-m", "feat: later")
+	run(t, workDir, "git", "checkout", "main")
+
+	e := newTestEngineer(t, workDir, g)
+	batch := []*MRInfo{{
+		ID:        "mr-advanced",
+		Branch:    branch,
+		Target:    "main",
+		CommitSHA: commit,
+	}}
+
+	_, _, err := e.BuildRebaseStack(context.Background(), batch, "main")
+	if err == nil {
+		t.Fatal("BuildRebaseStack succeeded for advanced source branch")
+	}
+	if !strings.Contains(err.Error(), "changed from submitted head") {
+		t.Fatalf("BuildRebaseStack error = %q, want submitted-head drift", err.Error())
 	}
 }
 
@@ -823,7 +872,7 @@ func TestGetMergeMessage_Fallback(t *testing.T) {
 	}
 
 	msg := e.getMergeMessage(mr)
-	if !strings.Contains(msg, "Squash merge") {
+	if !strings.Contains(msg, "Merge") {
 		t.Errorf("expected fallback message, got %q", msg)
 	}
 	if !strings.Contains(msg, "gt-abc") {

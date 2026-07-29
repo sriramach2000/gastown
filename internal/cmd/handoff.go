@@ -685,6 +685,11 @@ func resolveRoleToSession(role string) (string, error) {
 //   - <rig>/<name> -> gt-<rig>-<name> (polecat shorthand, if name isn't a known role)
 func resolvePathToSession(path string) (string, error) {
 	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		if !safeAgentPathSegment(part) {
+			return "", fmt.Errorf("invalid target path segment in %q", path)
+		}
+	}
 
 	// Handle <rig>/crew/<name> format
 	if len(parts) == 3 && parts[1] == constants.RoleCrew {
@@ -969,6 +974,7 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	if _, hasNodeOpts := agentEnv["NODE_OPTIONS"]; !hasNodeOpts {
 		envMap["NODE_OPTIONS"] = ""
 	}
+	config.SanitizeAgentEnv(envMap, agentEnv)
 
 	// Build the full command with OS-appropriate env prefix
 	var cdPrefix string

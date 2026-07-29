@@ -1957,6 +1957,7 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	if result.Args == nil && preset != nil {
 		result.Args = append([]string(nil), preset.Args...)
 	}
+	result.Args = ensureCodexAutomationArgs(result.Command, result.Args)
 
 	// Auto-fill Hooks defaults from preset for agents that support hooks.
 	if result.Hooks == nil && preset != nil && preset.HooksProvider != "" {
@@ -2403,6 +2404,8 @@ func SanitizeAgentEnv(resolvedEnv, callerEnv map[string]string) {
 	if _, ok := callerEnv["CLAUDECODE"]; !ok {
 		resolvedEnv["CLAUDECODE"] = ""
 	}
+
+	clearBDTargetSelectorEnv(resolvedEnv)
 }
 
 // PrependEnv prepends export statements to a command string.

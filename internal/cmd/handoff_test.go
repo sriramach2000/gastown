@@ -23,6 +23,16 @@ func setupHandoffTestRegistry(t *testing.T) {
 	t.Cleanup(func() { session.SetDefaultRegistry(old) })
 }
 
+func TestResolvePathToSessionRejectsUnsafeSegments(t *testing.T) {
+	for _, target := range []string{"../crew/toast", "gastown/../toast", "gastown/crew/..", `gastown\crew\toast`} {
+		t.Run(target, func(t *testing.T) {
+			if _, err := resolvePathToSession(target); err == nil {
+				t.Fatalf("resolvePathToSession(%q) error = nil, want rejection", target)
+			}
+		})
+	}
+}
+
 func TestHandoffStdinFlag(t *testing.T) {
 	t.Run("errors when both stdin and message provided", func(t *testing.T) {
 		// Save and restore flag state
@@ -252,6 +262,86 @@ func TestBuildRestartCommand_MergesAgentPresetEnv(t *testing.T) {
 		}
 		if !strings.Contains(cmd, v) {
 			t.Errorf("agent preset env value for %q (%q) missing in restart command\ncmd: %s", k, v, cmd)
+		}
+	}
+}
+
+func TestBuildRestartCommand_ClearsBDTargetSelectors(t *testing.T) {
+	setupHandoffTestRegistry(t)
+
+	origCwd, _ := os.Getwd()
+	origGTAgent := os.Getenv("GT_AGENT")
+	origTownRoot := os.Getenv("GT_TOWN_ROOT")
+	origRoot := os.Getenv("GT_ROOT")
+	t.Cleanup(func() {
+		_ = os.Chdir(origCwd)
+		_ = os.Setenv("GT_AGENT", origGTAgent)
+		_ = os.Setenv("GT_TOWN_ROOT", origTownRoot)
+		_ = os.Setenv("GT_ROOT", origRoot)
+	})
+
+	townRoot := t.TempDir()
+	rigPath := filepath.Join(townRoot, "gastown")
+	witnessDir := filepath.Join(rigPath, "witness")
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"gastown"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.MkdirAll(witnessDir, 0755); err != nil {
+		t.Fatalf("mkdir witness dir: %v", err)
+	}
+
+	townSettings := config.NewTownSettings()
+	townSettings.DefaultAgent = "target-cleaner"
+	townSettings.Agents = map[string]*config.RuntimeConfig{
+		"target-cleaner": {
+			Command: "claude",
+			Args:    []string{"--dangerously-skip-permissions"},
+			Env: map[string]string{
+				"BEADS_DIR":                  "/agent/beads",
+				"BEADS_DOLT_DATA_DIR":        "/agent/data",
+				"BEADS_DOLT_SERVER_DATABASE": "agentdb",
+				"BEADS_DOLT_SERVER_SOCKET":   "/agent/socket",
+				"GT_DOLT_DATA":               "/agent/data",
+				"GT_DOLT_PORT":               "1555",
+				"GT_DOLT_HOST":               "agent-host",
+			},
+		},
+	}
+	if err := config.SaveTownSettings(config.TownSettingsPath(townRoot), townSettings); err != nil {
+		t.Fatalf("SaveTownSettings: %v", err)
+	}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), config.NewRigSettings()); err != nil {
+		t.Fatalf("SaveRigSettings: %v", err)
+	}
+
+	_ = os.Setenv("GT_AGENT", "target-cleaner")
+	_ = os.Setenv("GT_TOWN_ROOT", "")
+	_ = os.Setenv("GT_ROOT", "")
+	if err := os.Chdir(witnessDir); err != nil {
+		t.Fatalf("chdir witness dir: %v", err)
+	}
+
+	cmd, err := buildRestartCommand("gt-witness")
+	if err != nil {
+		t.Fatalf("buildRestartCommand: %v", err)
+	}
+
+	for _, key := range []string{"BEADS_DIR", "BEADS_DOLT_DATA_DIR", "BEADS_DOLT_SERVER_DATABASE", "BEADS_DOLT_SERVER_SOCKET", "GT_DOLT_DATA"} {
+		if !strings.Contains(cmd, key+"=") {
+			t.Fatalf("restart command missing cleared %s assignment: %q", key, cmd)
+		}
+	}
+	for _, stale := range []string{"/agent/beads", "/agent/data", "agentdb", "/agent/socket"} {
+		if strings.Contains(cmd, stale) {
+			t.Fatalf("restart command leaked stale bd selector value %q: %q", stale, cmd)
+		}
+	}
+	for _, want := range []string{"GT_DOLT_PORT=1555", "GT_DOLT_HOST=agent-host"} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("restart command missing preserved connection env %q: %q", want, cmd)
 		}
 	}
 }
@@ -542,6 +632,22 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			gtLog := filepath.Join(t.TempDir(), "gt.log")
+			_ = writeBDStub(t, binDir, "#!/bin/sh\nexit 0\n", "@echo off\r\nexit /b 0\r\n")
+			gtStub := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"" + gtLog + "\"\nprintf 'stub gt %s\\n' \"$*\"\nexit 0\n"
+			if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtStub), 0755); err != nil {
+				t.Fatalf("write gt stub: %v", err)
+			}
+			gtCmdStub := "@echo off\r\necho %* >> \"" + gtLog + "\"\r\necho stub gt %*\r\nexit /b 0\r\n"
+			if err := os.WriteFile(filepath.Join(binDir, "gt.cmd"), []byte(gtCmdStub), 0644); err != nil {
+				t.Fatalf("write gt.cmd stub: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			isolatedRoot := t.TempDir()
+			t.Setenv("GT_TOWN_ROOT", isolatedRoot)
+			t.Setenv("GT_ROOT", isolatedRoot)
+			t.Chdir(isolatedRoot)
 			t.Setenv("GT_ROLE", tt.role)
 			t.Setenv("GT_POLECAT", tt.polecat)
 			// Ensure deterministic non-tmux execution so the non-polecat
@@ -583,6 +689,11 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 				} else {
 					t.Errorf("unexpected polecat redirect with GT_ROLE=%q GT_POLECAT=%q; output: %s", tt.role, tt.polecat, output)
 				}
+			}
+			gtLogBytes, _ := os.ReadFile(gtLog)
+			stubRan := strings.Contains(string(gtLogBytes), "done --status DEFERRED")
+			if stubRan != tt.wantBlock {
+				t.Errorf("gt stub ran = %v, want %v; log: %s", stubRan, tt.wantBlock, gtLogBytes)
 			}
 		})
 	}
